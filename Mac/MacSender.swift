@@ -374,6 +374,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 throw NSError(domain: "MacSender", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "no displays found"])
             }
+            // Touch/scroll/Pencil land on the display being mirrored — the
+            // same one the receiver's normalized coordinates describe.
+            inputInjector = InputInjector(displayID: display.displayID)
+            Log.info("mirror: input injector on display \(display.displayID), "
+                + "accessibility trusted: \(AXIsProcessTrusted())")
             // SCDisplay.width/height are POINTS. Capturing at points on a
             // Retina panel discards half the raster before the encoder ever
             // sees it, and no quality setting can bring it back — read the
@@ -384,6 +389,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             try await startCapture(display: display,
                                    sourcePixelsWide: pixelsW, sourcePixelsHigh: pixelsH,
                                    receiver: info)
+            let barDisplayID = display.displayID
+            await MainActor.run { MirrorControlBar.show(on: barDisplayID) }
+
+            // Same Accessibility wait as Extend: without trust, macOS drops the
+            // synthetic events silently and touch looks dead.
+            if !AXIsProcessTrusted() {
+                await status("Mirroring — grant Accessibility for touch input")
+                while !AXIsProcessTrusted() {
+                    try await Task.sleep(for: .seconds(2))
+                    if stopped { return }
+                }
+                Log.info("Accessibility permission granted — touch input live")
+            }
 
         case .extend:
             // awaitingWake is queue-confined — read it there before surfacing.
@@ -638,6 +656,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         throw NSError(domain: "MacSender", code: 1,
                                       userInfo: [NSLocalizedDescriptionKey: "no display found"])
                     }
+                    inputInjector = InputInjector(displayID: display.displayID)
                     let displayMode = CGDisplayCopyDisplayMode(display.displayID)
                     try await startCapture(
                         display: display,
@@ -914,6 +933,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         stopped = true
+        if mode == .mirror {
+            Task { @MainActor in MirrorControlBar.hide() }
+        }
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
         cursorImageTimer?.cancel()

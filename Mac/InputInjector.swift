@@ -26,6 +26,7 @@ final class InputInjector {
 
     private let displayID: CGDirectDisplayID
     private var isDown = false
+    private var pressIsRight = false   // the current touchscreen press is a right click
     private var penDown = false
     // A real event source (vs nil) plus non-zero clickState on down/up: menu
     // tracking treats sourceless/zero-click synthetic clicks as malformed — menus
@@ -78,6 +79,7 @@ final class InputInjector {
             x: bounds.origin.x + x * bounds.width,
             y: bounds.origin.y + y * bounds.height
         )
+        if handleTrackpad(phase: phase, point: point, bounds: bounds) { return }
 
         let type: CGEventType
         // Click count on the release. A cancel means "a second finger joined,
@@ -90,17 +92,18 @@ final class InputInjector {
         var clickState = 1
         switch phase {
         case "began":
-            type = .leftMouseDown
+            pressIsRight = PointerModeState.shared.takeRightClick(at: point)
+            type = pressIsRight ? .rightMouseDown : .leftMouseDown
             isDown = true
         case "moved":
-            type = isDown ? .leftMouseDragged : .mouseMoved
+            type = isDown ? (pressIsRight ? .rightMouseDragged : .leftMouseDragged) : .mouseMoved
         case "ended":
             guard isDown else { return }   // spurious up without a down
-            type = .leftMouseUp
+            type = pressIsRight ? .rightMouseUp : .leftMouseUp
             isDown = false
         case "cancelled":
             guard isDown else { return }
-            type = .leftMouseUp
+            type = pressIsRight ? .rightMouseUp : .leftMouseUp
             isDown = false
             clickState = 0
         default:
@@ -108,8 +111,174 @@ final class InputInjector {
         }
 
         guard let event = CGEvent(mouseEventSource: source, mouseType: type,
-                                  mouseCursorPosition: point, mouseButton: .left) else { return }
+                                  mouseCursorPosition: point,
+                                  mouseButton: pressIsRight ? .right : .left) else { return }
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+        event.post(tap: .cghidEventTap)
+    }
+
+    // MARK: - Trackpad mode
+
+    /// The receiver cannot say when a finger lands: it withholds `began` until
+    /// the press commits (hold or slop) and then sends it at the LANDING point,
+    /// after hover `moved`s that already went further. So a stroke is read off
+    /// the message stream itself — a gap or a jump starts a new one — and
+    /// `began` only marks the finger as down, its coordinates are not used.
+    private struct PadStroke {
+        var lastEvent: CFAbsoluteTime = 0
+        var lastPoint = CGPoint.zero
+        var start: CFAbsoluteTime = 0
+        var travel: CGFloat = 0
+        var cursor = CGPoint.zero
+        var direct = true          // stroke handled as a touchscreen
+        var dragArmed = false      // stroke began right after a tap
+        var dragging = false
+        var fingerDown = false     // between `began` and `ended`/`cancelled`
+        var lastTapEnd: CFAbsoluteTime = 0
+        var lastTapPoint = CGPoint.zero
+        var tapCount = 0
+    }
+    private var pad = PadStroke()
+
+    /// Messages further apart than this belong to different strokes. UIKit
+    /// sends nothing while a finger rests, so a resumed movement also counts
+    /// as new — it only loses its first sample.
+    private let strokeGap: CFTimeInterval = 0.08
+    /// A single-sample move this large is a new finger, not motion (e.g. the
+    /// two-finger scroll's one positioning `moved`).
+    private let strokeJump: CGFloat = 150
+    /// A finger held still this long, then slid, drags. Measured as the
+    /// silence after the press commits (~120 ms after landing on the receiver).
+    private let longPressDelay: CFTimeInterval = 0.3
+    /// Constant on purpose: the receiver also sends predicted samples that are
+    /// corrected by the next real one, and only a linear gain lets those
+    /// back-and-forth deltas cancel exactly.
+    private var trackpadGain: CGFloat {
+        let v = UserDefaults.standard.double(forKey: "trackpadSpeed")
+        return v > 0 ? CGFloat(v) : 1.6
+    }
+
+    /// Returns true when the event was consumed as trackpad input.
+    private func handleTrackpad(phase: String, point: CGPoint, bounds: CGRect) -> Bool {
+        let state = PointerModeState.shared
+        let now = CFAbsoluteTimeGetCurrent()
+        let jump = hypot(point.x - pad.lastPoint.x, point.y - pad.lastPoint.y)
+        // A committed finger may rest (UIKit sends nothing then) and move
+        // again: that is still one stroke — it is what makes a long press
+        // readable at all.
+        let newStroke = !pad.fingerDown
+            && (now - pad.lastEvent > strokeGap || jump > strokeJump)
+        let silence = now - pad.lastEvent
+        pad.lastEvent = now
+
+        if newStroke, phase == "moved" || phase == "began" {
+            if pad.dragging {   // a drag whose end never arrived
+                postMouse(.leftMouseUp, at: pad.cursor, clickState: 1)
+                pad.dragging = false
+            }
+            pad.lastPoint = point
+            pad.start = now
+            pad.travel = 0
+            // A touch on the control bar stays a direct click, so the switch
+            // back to touch mode is always reachable.
+            pad.direct = state.mode != .trackpad || state.isDirect(point)
+            pad.cursor = currentCursor()
+            pad.dragArmed = now - pad.lastTapEnd <= SystemClickMetrics.interval
+            if phase == "began" { pad.fingerDown = true }
+            Log.info("pointer stroke: \(phase) mode=\(state.mode.rawValue) direct=\(pad.direct) "
+                + "at=\(Int(point.x)),\(Int(point.y)) bar=\(state.barRect.map { "\($0)" } ?? "nil") "
+                + "kb=\(state.keyboardRect.map { "\($0)" } ?? "nil")")
+            return !pad.direct
+        }
+        if pad.direct {
+            // The finger's state is tracked for EVERY stroke, direct ones
+            // included: a `began` left without its `ended` would glue every
+            // later touch into one endless direct stroke, and trackpad mode
+            // would never engage again.
+            switch phase {
+            case "began": pad.fingerDown = true
+            case "ended", "cancelled":
+                pad.fingerDown = false
+                pad.lastEvent = 0
+            default: break
+            }
+            return false
+        }
+
+        switch phase {
+        case "moved":
+            let dx = point.x - pad.lastPoint.x
+            let dy = point.y - pad.lastPoint.y
+            pad.lastPoint = point
+            // UIKit sends nothing while a finger rests, so the silence
+            // before this sample IS how long the finger held still.
+            if !pad.dragging, pad.fingerDown, pad.travel < 8,
+               silence >= longPressDelay {
+                // Hold still, then slide: drag.
+                pad.dragging = true
+                postMouse(.leftMouseDown, at: pad.cursor, clickState: 1)
+            }
+            pad.travel += hypot(dx, dy)
+            if pad.dragArmed, !pad.dragging, pad.travel > 6 {
+                // Tap, then touch again and slide: drag, as on a Mac trackpad.
+                pad.dragging = true
+                postMouse(.leftMouseDown, at: pad.cursor, clickState: 1)
+            }
+            let g = trackpadGain
+            pad.cursor.x = min(max(pad.cursor.x + dx * g, bounds.minX), bounds.maxX - 1)
+            pad.cursor.y = min(max(pad.cursor.y + dy * g, bounds.minY), bounds.maxY - 1)
+            postMouse(pad.dragging ? .leftMouseDragged : .mouseMoved, at: pad.cursor, clickState: 0)
+        case "began":
+            // Finger committed; its coordinates are the landing point, already past.
+            pad.fingerDown = true
+        case "ended":
+            if pad.dragging {
+                postMouse(.leftMouseUp, at: pad.cursor, clickState: 1)
+                pad.dragging = false
+                pad.lastTapEnd = 0
+            } else if pad.travel < 8, now - pad.start < 0.35,
+                      PointerModeState.shared.takeRightClick(at: pad.cursor) {
+                // Armed from the bar: this tap is a right click. It stays out
+                // of the multi-click chain and arms no tap-and-drag.
+                postMouse(.rightMouseDown, at: pad.cursor, clickState: 1, button: .right)
+                postMouse(.rightMouseUp, at: pad.cursor, clickState: 1, button: .right)
+                pad.lastTapEnd = 0
+            } else if pad.travel < 8, now - pad.start < 0.35 {
+                // A tap clicks where the cursor is; taps in a row count up
+                // (double click, triple click) like the system does.
+                let near = hypot(pad.cursor.x - pad.lastTapPoint.x,
+                                 pad.cursor.y - pad.lastTapPoint.y) <= SystemClickMetrics.distance
+                let count = (now - pad.lastTapEnd <= SystemClickMetrics.interval && near)
+                    ? pad.tapCount + 1 : 1
+                postMouse(.leftMouseDown, at: pad.cursor, clickState: count)
+                postMouse(.leftMouseUp, at: pad.cursor, clickState: count)
+                pad.tapCount = count
+                pad.lastTapEnd = now
+                pad.lastTapPoint = pad.cursor
+            }
+            pad.fingerDown = false
+            pad.lastEvent = 0   // the next message starts a new stroke
+        case "cancelled":
+            // A second finger joined: this was a scroll, not a click.
+            if pad.dragging {
+                postMouse(.leftMouseUp, at: pad.cursor, clickState: 0)
+                pad.dragging = false
+            }
+            pad.fingerDown = false
+            pad.lastEvent = 0
+        default:
+            break
+        }
+        return true
+    }
+
+    private func postMouse(_ type: CGEventType, at point: CGPoint, clickState: Int,
+                           button: CGMouseButton = .left) {
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type,
+                                  mouseCursorPosition: point, mouseButton: button) else { return }
+        if clickState > 0 {
+            event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+        }
         event.post(tap: .cghidEventTap)
     }
 
