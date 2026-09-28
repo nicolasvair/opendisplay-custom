@@ -2,6 +2,7 @@
 > **Minimal fork for personal needs** of [peetzweg/opendisplay](https://github.com/peetzweg/opendisplay).
 > Not affiliated with the official app, no support, no releases — build it
 > yourself. The changes live on the `custom` branch; `main` tracks upstream.
+> Many thanks to peetzweg for this wonderful app, be sure to support him and his work if you can.
 >
 > **Changes from the official version**
 >
