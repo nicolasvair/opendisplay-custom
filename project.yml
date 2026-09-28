@@ -132,9 +132,10 @@ targets:
         SUEnableAutomaticChecks: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.receiver
-        PRODUCT_NAME: OpenDisplay Receiver
-        BUNDLE_DISPLAY_NAME: OpenDisplay Receiver
+        # Custom fork: own name and bundle ID, like the sender.
+        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.receiver.custom
+        PRODUCT_NAME: OpenDisplay Receiver Custom
+        BUNDLE_DISPLAY_NAME: OpenDisplay Receiver Custom
         # Log.swift's file locking helpers live in the C bridging header.
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES

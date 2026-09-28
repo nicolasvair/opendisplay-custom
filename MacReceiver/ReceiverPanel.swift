@@ -7,6 +7,8 @@ import SwiftUI
 struct ReceiverSections: View {
     @ObservedObject var controller: ReceiverController
     @AppStorage("showAnalytics") private var showAnalytics = false
+    @StateObject private var pairing = PairingResponder()
+    @State private var pairingOpen = false
 
     var body: some View {
         // The receiver exists only while receiver mode is on; observed in a
@@ -21,6 +23,34 @@ struct ReceiverSections: View {
             Text("Name")
         } footer: {
             Text("How this Mac appears in the other Mac's Devices list.")
+        }
+
+        Section {
+            ForEach(pairing.pairedMacs) { mac in
+                HStack {
+                    Label(mac.peerName, systemImage: "lock.fill")
+                    Spacer()
+                    Button("Oublier") { pairing.forget(mac) }
+                        .controlSize(.small)
+                }
+            }
+            if pairingOpen, let receiver = controller.receiver {
+                PairingResponderView(responder: pairing, serviceName: receiver.currentServiceName)
+                Button("Fermer") { pairingOpen = false }
+                    .controlSize(.small)
+            } else {
+                Button("Appairer un Mac…") { pairingOpen = true }
+                    .disabled(controller.receiver == nil)
+            }
+        } header: {
+            Text("Sécurité")
+        } footer: {
+            Text(pairing.pairedMacs.isEmpty
+                 ? "Aucun Mac appairé : ce Mac refuse toute connexion réseau. Appaire le Mac à étendre pour qu'il s'y connecte (chiffré)."
+                 : "Seuls les Mac appairés peuvent se connecter, et le flux est chiffré.")
+        }
+        .onAppear {
+            pairing.onPairingsChanged = { [weak controller] in controller?.receiver?.pairingsDidChange() }
         }
 
         Section {
