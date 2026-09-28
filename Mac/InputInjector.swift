@@ -73,13 +73,13 @@ final class InputInjector {
     }
 
     /// x/y are normalized [0,1] in video space (origin top-left).
-    func handleTouch(phase: String, x: Double, y: Double) {
+    func handleTouch(phase: String, x: Double, y: Double, allowTrackpad: Bool = true) {
         let bounds = CGDisplayBounds(displayID)   // global CG coords, y-down
         let point = CGPoint(
             x: bounds.origin.x + x * bounds.width,
             y: bounds.origin.y + y * bounds.height
         )
-        if handleTrackpad(phase: phase, point: point, bounds: bounds) { return }
+        if allowTrackpad, handleTrackpad(phase: phase, point: point, bounds: bounds) { return }
 
         let type: CGEventType
         // Click count on the release. A cancel means "a second finger joined,
@@ -271,6 +271,55 @@ final class InputInjector {
             break
         }
         return true
+    }
+
+    // MARK: - Receiver-side trackpad (local controls)
+
+    private var localLeftDown = false
+    private var localRightDown = false
+    // Where the receiver last put the cursor: a button right after a move
+    // must land there, and a freshly posted move can still read back stale.
+    private var lastPointer: (point: CGPoint, time: CFAbsoluteTime)?
+
+    private func pointerPosition() -> CGPoint {
+        if let last = lastPointer, CFAbsoluteTimeGetCurrent() - last.time < 1 { return last.point }
+        return currentCursor()
+    }
+
+    /// A relative move computed by the receiver (acceleration included), in
+    /// display points. Crosses onto other displays like a real mouse; drags
+    /// while a button the receiver pressed is held.
+    func handlePointer(dx: Double, dy: Double) {
+        let from = pointerPosition()
+        let to = desktopPoint(from: from, to: CGPoint(x: from.x + dx, y: from.y + dy),
+                              fallback: CGDisplayBounds(displayID))
+        lastPointer = (to, CFAbsoluteTimeGetCurrent())
+        let type: CGEventType = localLeftDown ? .leftMouseDragged
+            : localRightDown ? .rightMouseDragged : .mouseMoved
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type,
+                                  mouseCursorPosition: to,
+                                  mouseButton: localRightDown ? .right : .left) else { return }
+        // Apps that read raw deltas (games, some canvases) get them too.
+        event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
+        event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+        event.post(tap: .cghidEventTap)
+    }
+
+    /// A button press or release at the cursor, or at normalized (nx, ny) on
+    /// the streamed display when given (touch mode's armed right click).
+    func handleButton(right: Bool, down: Bool, clicks: Int, nx: Double? = nil, ny: Double? = nil) {
+        if let nx, let ny {
+            lastPointer = (screenPoint(nx: nx, ny: ny), CFAbsoluteTimeGetCurrent())
+        }
+        let type: CGEventType
+        switch (right, down) {
+        case (false, true): type = .leftMouseDown; localLeftDown = true
+        case (false, false): guard localLeftDown else { return }; type = .leftMouseUp; localLeftDown = false
+        case (true, true): type = .rightMouseDown; localRightDown = true
+        case (true, false): guard localRightDown else { return }; type = .rightMouseUp; localRightDown = false
+        }
+        postMouse(type, at: pointerPosition(), clickState: max(1, min(clicks, 3)),
+                  button: right ? .right : .left)
     }
 
     private func postMouse(_ type: CGEventType, at point: CGPoint, clickState: Int,

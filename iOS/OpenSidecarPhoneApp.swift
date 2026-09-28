@@ -72,11 +72,18 @@ struct ReceiverScreen: View {
             ZStack {
                 if isStreaming {
                     Color.black.ignoresSafeArea()
-                    VideoLayerView(displayLayer: model.receiver.displayLayer,
-                                   receiver: model.receiver,
-                                   useMetal: metalRenderer)
-                        .id(metalRenderer)   // rebuild the layer tree on toggle
-                        .ignoresSafeArea()
+                    // The picture fills the screen above the local control
+                    // bar; the Mac was told the desktop is that much shorter.
+                    // The keyboard floats over it without resizing anything.
+                    VStack(spacing: 0) {
+                        VideoLayerView(displayLayer: model.receiver.displayLayer,
+                                       receiver: model.receiver,
+                                       useMetal: metalRenderer)
+                            .id(metalRenderer)   // rebuild the layer tree on toggle
+                            .overlay(MacKeysRow(), alignment: .bottom)
+                        LocalControlBar()
+                    }
+                    .ignoresSafeArea()
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -523,6 +530,9 @@ final class ReceiverModel: ObservableObject {
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
                                   fallbackServiceName: UIDevice.current.name)
+        // The control bar, keyboard and trackpad are local (custom build).
+        receiver.localControls = true
+        receiver.reservedBottomPoints = Double(LocalControls.barHeight)
         // Announce the native panel size to the Mac.
         let native = UIScreen.main.nativeBounds.size   // portrait pixels
         receiver.setNativePanel(long: Int(max(native.width, native.height)),
@@ -693,6 +703,7 @@ struct VideoLayerView: UIViewRepresentable {
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
         view.addGestureRecognizer(pan)
+        view.installLocalControls(pan: pan)
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -722,6 +733,40 @@ struct VideoLayerView: UIViewRepresentable {
         weak var receiver: StreamReceiver?
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
+        private let trackpad = TrackpadEngine()
+        private let keyInput = MacKeyInputView()
+        private var localCancellables = Set<AnyCancellable>()
+
+        /// Hooks the local keyboard and trackpad to the shared bar state.
+        func installLocalControls(pan: UIPanGestureRecognizer) {
+            let controls = LocalControls.shared
+            trackpad.receiver = receiver
+            controls.receiver = receiver
+            trackpad.pointsPerVideoPixel = { [weak self] in
+                guard let self, let video = self.receiver?.videoSize, video != .zero else { return 1 }
+                return min(self.bounds.width / video.width, self.bounds.height / video.height)
+            }
+            keyInput.receiver = receiver
+            keyInput.onDismiss = { if controls.keyboardVisible { controls.keyboardVisible = false } }
+            addSubview(keyInput)   // zero-size; only there to own the keyboard
+            controls.$keyboardVisible
+                .removeDuplicates()
+                .sink { [weak self] visible in
+                    guard let self else { return }
+                    if visible { _ = self.keyInput.becomeFirstResponder() }
+                    else if self.keyInput.isFirstResponder { _ = self.keyInput.resignFirstResponder() }
+                }
+                .store(in: &localCancellables)
+            controls.$mode
+                .sink { [weak self] mode in
+                    // Trackpad mode reads raw touches; the pan recognizer
+                    // would cancel them to scroll on its own.
+                    pan.isEnabled = mode == .touch
+                    self?.trackpad.reset()
+                    controls.rightClickArmed = false
+                }
+                .store(in: &localCancellables)
+        }
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -916,6 +961,16 @@ struct VideoLayerView: UIViewRepresentable {
                   let norm = normalized(touch.location(in: self)) else { return }
             lastNorm = norm
 
+            // Armed from the bar: this tap is a right click where it lands.
+            if LocalControls.shared.rightClickArmed {
+                if phase == "ended" {
+                    receiver?.sendButton(right: true, down: true, at: norm)
+                    receiver?.sendButton(right: true, down: false, at: norm)
+                    LocalControls.shared.rightClickArmed = false
+                }
+                return
+            }
+
             switch phase {
             case "began":
                 let location = touch.location(in: self)
@@ -1007,7 +1062,15 @@ struct VideoLayerView: UIViewRepresentable {
             }
             // Palm rejection: ignore resting fingers while the pen is down.
             if !finger.isEmpty && !inputEngine.hasActivePen {
-                send(phase, finger, event)
+                if LocalControls.shared.mode == .trackpad {
+                    switch phase {
+                    case "began": trackpad.began(finger, all: event?.allTouches ?? finger)
+                    case "moved": trackpad.moved(finger, event: event)
+                    default: trackpad.ended(finger, cancelled: phase == "cancelled")
+                    }
+                } else {
+                    send(phase, finger, event)
+                }
             }
         }
 

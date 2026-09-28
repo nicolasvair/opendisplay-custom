@@ -293,20 +293,30 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
+    /// Custom local controls: the receiver draws its own control bar and
+    /// keyboard and runs trackpad mode itself (announced in hello, so the Mac
+    /// hides its bar and treats touches as direct). Set before start().
+    var localControls = false
+    /// Height (points) kept free at the bottom of the panel for the local
+    /// control bar: the announced desktop is that much shorter, so the bar
+    /// never covers the picture. Set before setNativePanel/start().
+    var reservedBottomPoints: Double = 0
+    private var reservedPixels: Int { Int((reservedBottomPoints * deviceScale).rounded()) }
+
     func setNativePanel(long: Int, short: Int, scale: Double) {
         nativeLong = long
         nativeShort = short
         deviceScale = scale
         if devicePixelsWide == 0 {   // default landscape until the view reports
             devicePixelsWide = long
-            devicePixelsHigh = short
+            devicePixelsHigh = short - reservedPixels
         }
     }
 
     func setOrientation(portrait: Bool) {
         guard nativeLong > 0 else { return }
         setPanel(pixelsWide: portrait ? nativeShort : nativeLong,
-                 pixelsHigh: portrait ? nativeLong : nativeShort,
+                 pixelsHigh: (portrait ? nativeLong : nativeShort) - reservedPixels,
                  scale: deviceScale)
     }
 
@@ -977,6 +987,7 @@ final class StreamReceiver: ObservableObject {
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
             "displayMaxFrameRate": displayMaxFrameRate,
         ]
+        if localControls { hello["localControls"] = true }
         // Additive joint capability. The legacy rectangle below stays on the
         // wire while independently updated senders remain in the field.
         var h264: [String: Any] = ["codec": "h264", "maxFrameRate": 60]
@@ -1089,6 +1100,31 @@ final class StreamReceiver: ObservableObject {
 
     func sendProximity(entering: Bool, x: Double, y: Double) {
         sendControl(["type": "proximity", "entering": entering, "x": x, "y": y])
+    }
+
+    // Custom local-controls messages (see `localControls`).
+
+    /// Relative pointer move in desktop points, acceleration already applied.
+    func sendPointer(dx: Double, dy: Double) {
+        sendControl(["type": "pointer", "dx": dx, "dy": dy])
+    }
+
+    /// Mouse button at the current cursor position.
+    func sendButton(right: Bool, down: Bool, clicks: Int = 1, at point: (x: Double, y: Double)? = nil) {
+        var msg: [String: Any] = ["type": "button", "button": right ? "right" : "left",
+                                  "down": down, "clicks": clicks]
+        if let point { msg["x"] = point.x; msg["y"] = point.y }
+        sendControl(msg)
+    }
+
+    /// Typed text; `mods` bits: 1 ⌘, 2 ⌥, 4 ⌃, 8 ⇧.
+    func sendText(_ text: String, mods: Int = 0) {
+        sendControl(["type": "text", "s": text, "mods": mods])
+    }
+
+    /// A Mac virtual key code (Return, arrows, Escape…).
+    func sendKey(code: Int, mods: Int = 0) {
+        sendControl(["type": "key", "code": code, "mods": mods])
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,

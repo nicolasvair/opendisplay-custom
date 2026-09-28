@@ -42,8 +42,12 @@ struct PhoneInfo: Decodable {
     let maxEncodeHigh: Int?  //  6.5): cap the stream, keep the desktop size
     let displayMaxFrameRate: Int?       // presentation ceiling; absent = legacy 60
     let videoCaps: [VideoCapability]?   // codec-specific joint decode constraints
+    let localControls: Bool?  // custom: the receiver draws its own control bar
+                              // and keyboard and runs trackpad mode itself,
+                              // sending relative pointer/button/key messages
 
     var kind: String { device ?? "device" }
+    var hasLocalControls: Bool { localControls ?? false }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
 }
 
@@ -921,9 +925,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         captureDisplayID = display.displayID
         // The control bar lives on the streamed display — the mirrored Mac
-        // screen, or the iPad's virtual display in Extend.
+        // screen, or the iPad's virtual display in Extend — unless the
+        // receiver draws its own.
         let barDisplayID = display.displayID
-        await MainActor.run { MirrorControlBar.show(on: barDisplayID) }
+        if lastHello?.hasLocalControls == true {
+            await MainActor.run { MirrorControlBar.hide(ifOn: barDisplayID) }
+        } else {
+            await MainActor.run { MirrorControlBar.show(on: barDisplayID) }
+        }
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         startCursorEcho()
         // A capture that came back through any path (recovery, rotation,
@@ -2084,7 +2093,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
                let y = obj["y"] as? Double {
-                inputInjector?.handleTouch(phase: phase, x: x, y: y)
+                // A receiver with local controls runs trackpad mode itself:
+                // its touches are always direct.
+                inputInjector?.handleTouch(phase: phase, x: x, y: y,
+                                           allowTrackpad: lastHello?.hasLocalControls != true)
                 if let t = obj["t"] as? Double {
                     let delta = Date().timeIntervalSince1970 * 1000 - t
                     if delta > -50, delta < 1000 {
@@ -2096,6 +2108,29 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "scroll":
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handleScroll(dx: dx, dy: dy)
+            }
+        // Custom local-controls messages (receiver-side trackpad + keyboard).
+        case "pointer":
+            if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
+                inputInjector?.handlePointer(dx: dx, dy: dy)
+            }
+        case "button":
+            if let down = obj["down"] as? Bool {
+                inputInjector?.handleButton(right: (obj["button"] as? String) == "right", down: down,
+                                            clicks: obj["clicks"] as? Int ?? 1,
+                                            nx: obj["x"] as? Double, ny: obj["y"] as? Double)
+            }
+        case "text":
+            if let text = obj["s"] as? String {
+                let mods = obj["mods"] as? Int ?? 0
+                DispatchQueue.main.async { KeyPoster.shared.type(text, flags: KeyPoster.flags(mods)) }
+            }
+        case "key":
+            if let code = obj["code"] as? Int, (0..<128).contains(code) {
+                let mods = obj["mods"] as? Int ?? 0
+                DispatchQueue.main.async {
+                    KeyPoster.shared.press(code: CGKeyCode(code), flags: KeyPoster.flags(mods))
+                }
             }
         case "pencil":
             if let phase = obj["phase"] as? String,

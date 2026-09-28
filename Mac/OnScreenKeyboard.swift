@@ -225,8 +225,18 @@ private struct KeyboardView: View {
 /// that read key codes see the right key — and as a raw Unicode string
 /// otherwise (accents off the layout, symbols behind ⌥).
 @MainActor
-private final class KeyPoster {
+final class KeyPoster {
     static let shared = KeyPoster()
+
+    /// Wire modifier bits (receiver keyboard): 1 ⌘, 2 ⌥, 4 ⌃, 8 ⇧.
+    nonisolated static func flags(_ mods: Int) -> CGEventFlags {
+        var flags: CGEventFlags = []
+        if mods & 1 != 0 { flags.insert(.maskCommand) }
+        if mods & 2 != 0 { flags.insert(.maskAlternate) }
+        if mods & 4 != 0 { flags.insert(.maskControl) }
+        if mods & 8 != 0 { flags.insert(.maskShift) }
+        return flags
+    }
 
     private let source = CGEventSource(stateID: .hidSystemState)
     private var map: [String: (code: CGKeyCode, shift: Bool)] = [:]
