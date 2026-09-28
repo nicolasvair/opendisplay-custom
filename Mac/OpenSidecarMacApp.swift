@@ -254,16 +254,54 @@ final class SenderController: ObservableObject {
         }
     }
 
+    // MARK: - Pairing (Shared/Pairing.swift)
+
+    /// Receivers this Mac holds a pairing key for. WiFi runs only over
+    /// TLS-PSK to paired receivers: the plaintext service is never browsed or
+    /// dialed, so a device merely claiming a receiver's name gets nothing.
+    @Published private(set) var pairedDevices: [PairingKey] = PairingStore.load(.sender)
+    let wifiRequiresPairing = true
+
+    /// The secret for a WiFi service, nil if it is not a paired receiver.
+    private func pairingSecret(for result: NWBrowser.Result) -> Data? {
+        guard let id = txtID(of: result) else { return nil }
+        return pairedDevices.first { $0.peerID == id }?.secret
+    }
+
+    /// Re-read the keys after pairing or forgetting a device. A WiFi session
+    /// to a device that is no longer paired ends; a newly paired one is
+    /// picked up by auto-connect.
+    func pairingsChanged() {
+        pairedDevices = PairingStore.load(.sender)
+        for session in sessions where !session.onUSB {
+            if case .wifi(let result) = session.target, pairingSecret(for: result) == nil {
+                end(session)
+            }
+        }
+        autoConnect()
+    }
+
+    func forgetPairing(_ key: PairingKey) {
+        PairingStore.remove(peerID: key.peerID, .sender)
+        pairingsChanged()
+    }
+
     private func startBrowsing() {
         // TXT records carry the receiver's install id (new receivers).
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil), using: .tcp)
+        // Only TLS services (`tls=1`): plaintext and pairing-mode entries of
+        // the same type are never dialed.
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: PairingWire.serviceType, domain: nil),
+                                using: .tcp)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.discovered = Array(results)
+                self.discovered = Array(results.filter { PairingWire.txtFlag($0, PairingWire.secureTXTKey) })
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
             }
+        }
+        browser.stateUpdateHandler = { state in
+            if case .failed(let error) = state { Log.info("browser failed: \(error)") }
         }
         browser.start(queue: .main)
         self.browser = browser
@@ -385,10 +423,12 @@ final class SenderController: ObservableObject {
         for session in sessions where session.onUSB {
             guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
                   let result = wifiService(for: session) else { continue }
+            let secret = pairingSecret(for: result)
+            guard secret != nil || !wifiRequiresPairing else { continue }
             Log.info("cable detached for \(session.id) — failing over to WiFi")
             session.onUSB = false
             session.wifiServiceName = serviceName(of: result)
-            session.sender.switchTransport(to: .tcp(result.endpoint))
+            session.sender.switchTransport(to: .tcp(result.endpoint), pairingSecret: secret)
         }
     }
 
@@ -523,6 +563,16 @@ final class SenderController: ObservableObject {
         case .wifi: wifiRemembered.insert(id)
         }
 
+        // Paired-only WiFi: never dial a receiver this Mac holds no key for.
+        var secret: Data?
+        if case .wifi(let result) = target, wifiRequiresPairing {
+            guard let key = pairingSecret(for: result) else {
+                Log.info("\(id) is not paired — not connecting over WiFi")
+                return
+            }
+            secret = key
+        }
+
         let transport: SenderTransport
         switch target {
         case .usb(let udid):
@@ -543,6 +593,7 @@ final class SenderController: ObservableObject {
                                quality: quality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
+        sender.setPairingSecret(secret)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
@@ -929,6 +980,26 @@ struct ContentView: View {
                     .controlSize(.small)
                 }
                 .help("Opens System Settings → Displays, where you can position the extended displays relative to your Mac screen (Arrange…). Each device shows up as its own display, named after the device.")
+
+                Section {
+                    ForEach(controller.pairedDevices) { key in
+                        HStack {
+                            Image(systemName: "lock.fill").foregroundStyle(.green)
+                            Text(key.peerName)
+                            Spacer()
+                            Button("Oublier") { controller.forgetPairing(key) }
+                                .controlSize(.small)
+                        }
+                    }
+                    Button("Appairer un appareil…") { PairingWindow.show(controller: controller) }
+                        .controlSize(.small)
+                } header: {
+                    Text("Sécurité")
+                } footer: {
+                    Text("Le WiFi est toujours chiffré : seuls les appareils appairés s'y connectent. L'USB reste disponible pour tous. Pour appairer, débranche l'appareil (ses réglages ne sont accessibles que hors connexion).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 Section("Permissions") {
                     permissionRow(

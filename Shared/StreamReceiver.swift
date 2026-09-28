@@ -80,6 +80,10 @@ final class StreamReceiver: ObservableObject {
 
     private var listener: NWListener?
     private var listenerHealthy = false
+    // Pairing (Shared/Pairing.swift): network sessions arrive only on this
+    // TLS-PSK listener (base port + 2), up once a Mac is paired. The
+    // plaintext listener serves USB (loopback) only and is not advertised.
+    private var secureListener: NWListener?
     private var connection: NWConnection?
     // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
     // multi-hundred-KB video frames, so over WiFi one late frame stalls the
@@ -247,12 +251,32 @@ final class StreamReceiver: ObservableObject {
         return fresh
     }()
 
-    private var advertisedService: NWListener.Service {
+    /// The TLS listener's advertisement: the stock service, flagged `tls=1`.
+    private var secureService: NWListener.Service {
         var txt = NWTXTRecord()
         txt["id"] = Self.installID
         txt["pv"] = String(WireProtocol.version)   // issue #132
-        return NWListener.Service(name: serviceName, type: "_opensidecar._tcp",
+        txt[PairingWire.secureTXTKey] = "1"
+        return NWListener.Service(name: serviceName, type: PairingWire.serviceType,
                                   domain: nil, txtRecord: txt)
+    }
+
+    /// The name advertised on the network (for the pairing listener).
+    var currentServiceName: String { queue.sync { serviceName } }
+
+    /// Paired Macs changed: rebuild the listeners under the new policy and
+    /// drop a network session admitted under the old one (the Mac redials).
+    func pairingsDidChange() {
+        queue.async {
+            guard self.listener != nil else { return }
+            Log.info("pairing changed — restarting listeners")
+            if self.transport == "WiFi", let conn = self.connection {
+                conn.cancel()
+                self.connection = nil
+                self.setConnected(false)
+            }
+            self.restartListener()
+        }
     }
 
     /// Update the advertised name and re-publish if already listening.
@@ -263,7 +287,7 @@ final class StreamReceiver: ObservableObject {
             guard resolved != self.serviceName else { return }
             self.serviceName = resolved
             if self.listener != nil {
-                self.listener?.service = self.advertisedService
+                self.secureListener?.service = self.secureService
                 Log.info("re-advertising as \"\(resolved)\"")
             }
         }
@@ -417,6 +441,7 @@ final class StreamReceiver: ObservableObject {
                 self.listener?.cancel()
                 self.listener = nil
                 self.listenerHealthy = false
+                self.stopSecureListener()
                 self.stopCursorListener()
                 self.setConnected(false)
                 self.setStatus(status)
@@ -441,6 +466,8 @@ final class StreamReceiver: ObservableObject {
         listener?.cancel()
         listener = nil
         listenerHealthy = false
+        stopSecureListener()
+        stopCursorListener()
         startListener()
     }
 
@@ -566,63 +593,17 @@ final class StreamReceiver: ObservableObject {
             setStatus("Listener failed: \(error.localizedDescription)")
             return
         }
-        // Advertise on the local network so the Mac can discover us for WiFi
-        // mode (USB/usbmux connects straight to the port and ignores this).
-        listener?.service = advertisedService
+        // Plaintext serves the cable only (usbmux dials the port directly),
+        // so it is not advertised: WiFi goes through the TLS listener.
+        listener?.service = nil
         listener?.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
-            Log.info("new connection from \(String(describing: conn.endpoint))")
-            // usbmux-forwarded (cable) connections arrive from loopback;
-            // anything else came over the network.
-            let peer = String(describing: conn.endpoint)
-            self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
-                              || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
-            // A Bonjour dial races IPv6 and IPv4 and both handshakes can
-            // complete; the sender cancels its loser within milliseconds.
-            // Adopting every newcomer at once evicted the winner for a
-            // connection that was already dying (seen in the field as a
-            // reset-by-peer storm). With a connection in hand, a newcomer
-            // has to stay alive for a moment before it replaces it.
-            // A closed socket still reads as .ready until a receive hits
-            // EOF, so the proof is bytes: greet the newcomer and adopt it
-            // the moment it streams something back; a socket that closes
-            // or errors first is discarded and the session stays put.
-            if let current = self.connection, current.state != .cancelled,
-               !Self.isFailed(current.state) {
-                self.pendingConnections.append(conn)
-                conn.stateUpdateHandler = { [weak self] state in
-                    guard let self, case .ready = state else { return }
-                    // This socket has not won the session yet. Keep cursor UDP
-                    // out of its provisional hello: otherwise its flow could
-                    // arrive before adopt(), then be indistinguishable from
-                    // the old session's flow that adopt must retire.
-                    self.sendHello(on: conn, includeCursorPort: false)
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
-                        [weak self] data, _, isComplete, error in
-                        guard let self else { return }
-                        // Only a still-tracked candidate may adopt: adoption
-                        // of a rival and stop() both clear the list, so a
-                        // late callback can't evict a session or resurrect a
-                        // stopped receiver.
-                        guard self.pendingConnections.contains(where: { $0 === conn }) else {
-                            conn.cancel()
-                            return
-                        }
-                        self.pendingConnections.removeAll { $0 === conn }
-                        if let data, !data.isEmpty {
-                            self.adopt(conn, greeted: true, initialData: data)
-                        } else {
-                            Log.info("ignored a twin connection that closed at once"
-                                     + (error.map { " (\($0))" } ?? ""))
-                            conn.cancel()
-                        }
-                        _ = isComplete
-                    }
-                }
-                conn.start(queue: self.queue)
-            } else {
-                self.adopt(conn)
+            if !Self.isLoopback(conn) {
+                Log.info("refused plaintext connection from \(String(describing: conn.endpoint)) — WiFi is accepted only over TLS from a paired Mac")
+                conn.cancel()
+                return
             }
+            self.accept(conn)
         }
         listener?.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
@@ -641,7 +622,114 @@ final class StreamReceiver: ObservableObject {
             }
         }
         listener?.start(queue: queue)
-        startCursorListener()
+        // No UDP cursor channel: it is unauthenticated, and USB has no UDP
+        // anyway — cursor positions ride the (TLS) stream.
+        if !PairingStore.load(.receiver).isEmpty { startSecureListener() }
+    }
+
+    private func startSecureListener() {
+        let keys = PairingStore.load(.receiver).map { (identity: $0.peerID, secret: $0.secret) }
+        let params = SecureTransport.parameters(keys: keys)
+        params.allowLocalEndpointReuse = true
+        params.serviceClass = .interactiveVideo
+        let securePort = NWEndpoint.Port(rawValue: port &+ PairingWire.securePortOffset)!
+        let secure: NWListener
+        do {
+            secure = try NWListener(using: params, on: securePort)
+        } catch {
+            Log.info("secure listener failed on :\(securePort): \(error)")
+            return
+        }
+        secure.service = secureService
+        secure.newConnectionHandler = { [weak self] conn in
+            guard let self, self.secureListener === secure else { conn.cancel(); return }
+            self.accept(conn)
+        }
+        secure.stateUpdateHandler = { [weak self] state in
+            guard let self, self.secureListener === secure else { return }
+            switch state {
+            case .ready:
+                Log.info("secure listener ready on :\(securePort) for \(keys.count) paired Mac(s)")
+            case .failed(let error):
+                Log.info("secure listener failed: \(error) — restarting")
+                self.secureListener = nil
+                self.queue.asyncAfter(deadline: .now() + 1) {
+                    if self.listener != nil, self.secureListener == nil {
+                        self.startSecureListener()
+                    }
+                }
+            default: break
+            }
+        }
+        secureListener = secure
+        secure.start(queue: queue)
+    }
+
+    private func stopSecureListener() {
+        secureListener?.cancel()
+        secureListener = nil
+    }
+
+    /// A new stream connection (plaintext or TLS): adopt it, or let it prove
+    /// itself against a live session first.
+    private func accept(_ conn: NWConnection) {
+        Log.info("new connection from \(String(describing: conn.endpoint))")
+        // usbmux-forwarded (cable) connections arrive from loopback;
+        // anything else came over the network.
+        let peer = String(describing: conn.endpoint)
+        self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
+                          || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
+        // A Bonjour dial races IPv6 and IPv4 and both handshakes can
+        // complete; the sender cancels its loser within milliseconds.
+        // Adopting every newcomer at once evicted the winner for a
+        // connection that was already dying (seen in the field as a
+        // reset-by-peer storm). With a connection in hand, a newcomer
+        // has to stay alive for a moment before it replaces it.
+        // A closed socket still reads as .ready until a receive hits
+        // EOF, so the proof is bytes: greet the newcomer and adopt it
+        // the moment it streams something back; a socket that closes
+        // or errors first is discarded and the session stays put.
+        if let current = self.connection, current.state != .cancelled,
+           !Self.isFailed(current.state) {
+            self.pendingConnections.append(conn)
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self, case .ready = state else { return }
+                // This socket has not won the session yet. Keep cursor UDP
+                // out of its provisional hello: otherwise its flow could
+                // arrive before adopt(), then be indistinguishable from
+                // the old session's flow that adopt must retire.
+                self.sendHello(on: conn, includeCursorPort: false)
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
+                    [weak self] data, _, isComplete, error in
+                    guard let self else { return }
+                    // Only a still-tracked candidate may adopt: adoption
+                    // of a rival and stop() both clear the list, so a
+                    // late callback can't evict a session or resurrect a
+                    // stopped receiver.
+                    guard self.pendingConnections.contains(where: { $0 === conn }) else {
+                        conn.cancel()
+                        return
+                    }
+                    self.pendingConnections.removeAll { $0 === conn }
+                    if let data, !data.isEmpty {
+                        self.adopt(conn, greeted: true, initialData: data)
+                    } else {
+                        Log.info("ignored a twin connection that closed at once"
+                                 + (error.map { " (\($0))" } ?? ""))
+                        conn.cancel()
+                    }
+                    _ = isComplete
+                }
+            }
+            conn.start(queue: self.queue)
+        } else {
+            self.adopt(conn)
+        }
+    }
+
+    private static func isLoopback(_ conn: NWConnection) -> Bool {
+        let peer = String(describing: conn.endpoint)
+        return peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1") || peer.hasPrefix("localhost")
     }
 
     /// Make `conn` the session: replace any existing connection and reset

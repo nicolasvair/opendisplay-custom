@@ -309,6 +309,7 @@ struct OnboardingView: View {
 
 struct SettingsView: View {
     @ObservedObject var receiver: StreamReceiver
+    @StateObject private var pairing = PairingResponder()
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
@@ -342,6 +343,31 @@ struct SettingsView: View {
                 } footer: {
                     Text("Shown in the Mac app's WiFi connection menu. iOS hides this \(deviceKind)'s real name from apps, so set it here once.")
                 }
+
+                Section {
+                    ForEach(pairing.pairedMacs) { mac in
+                        HStack {
+                            Label(mac.peerName, systemImage: "lock.fill")
+                            Spacer()
+                            Button("Oublier", role: .destructive) { pairing.forget(mac) }
+                                .buttonStyle(.borderless)
+                        }
+                    }
+                    NavigationLink {
+                        PairingResponderView(responder: pairing,
+                                             serviceName: receiver.currentServiceName)
+                            .navigationTitle("Appairer un Mac")
+                    } label: {
+                        Label("Appairer un Mac", systemImage: "key")
+                    }
+                } header: {
+                    Text("Sécurité")
+                } footer: {
+                    Text(pairing.pairedMacs.isEmpty
+                         ? "Aucun Mac appairé : seul l'USB fonctionne. Appaire ton Mac pour te connecter en WiFi (chiffré)."
+                         : "WiFi chiffré : seuls les Mac appairés peuvent se connecter sans câble. L'USB reste ouvert.")
+                }
+                .onAppear { pairing.onPairingsChanged = { [weak receiver] in receiver?.pairingsDidChange() } }
 
                 Section {
                     Toggle("Performance overlay", isOn: $showAnalytics)

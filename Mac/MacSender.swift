@@ -102,6 +102,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // The dial target. Written on `queue` only (after init): the controller
     // can migrate a live session between transports via switchTransport.
     private var transport: SenderTransport
+    // Pairing secret for this receiver (Shared/Pairing.swift). When set, TCP
+    // dials run over TLS-PSK and the cable-upgrade probe stays off: a paired
+    // receiver refuses plaintext from the network. Queue-confined.
+    private var pairingSecret: Data?
     private let endpointName: String
     private let mode: CaptureMode
     private let quality: StreamQuality
@@ -971,9 +975,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// treats it like any reconnect: the fresh connection replaces the old
     /// one and the video resyncs with a keyframe. Which transport to be on
     /// is the controller's call (cable-in upgrade, unplug failover).
-    func switchTransport(to newTransport: SenderTransport) {
+    /// Sets (or clears) the pairing secret used by the next TCP dial.
+    func setPairingSecret(_ secret: Data?) {
+        queue.async { [weak self] in self?.pairingSecret = secret }
+    }
+
+    func switchTransport(to newTransport: SenderTransport, pairingSecret secret: Data? = nil) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
+            self.pairingSecret = secret
             let label = if case .usb = newTransport { "USB" } else { "WiFi" }
             Log.info("switching \(self.endpointName) to \(label)")
             self.transport = newTransport
@@ -1281,7 +1291,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // -forceUpgradeProbe YES: dev knob — loopback runs never look like
         // WiFi, so this is the only way to exercise probe+migrate on one Mac.
         if currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
-            startUpgradeProbing()
+            if pairingSecret == nil { startUpgradeProbing() }
         } else {
             stopUpgradeProbing()   // already off WiFi — nothing better to find
         }
@@ -1483,6 +1493,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         return result
     }
 
+    /// A TLS failure on a paired dial means the keys no longer match (the
+    /// device forgot this Mac): say so instead of a generic wait.
+    @discardableResult
+    private func reportPairingRejection(_ error: NWError) -> Bool {
+        guard pairingSecret != nil, case .tls = error else { return false }
+        Log.info("pairing: TLS handshake rejected by \(endpointName): \(error)")
+        let name = endpointName
+        Task { await self.status("\(name) rejected the pairing key — pair it again") }
+        return true
+    }
+
     private func connectTCP(_ endpoint: NWEndpoint) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
@@ -1491,7 +1512,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // there is one (field-tested: en10 chosen over en0). A WiFi-prohibited
         // pre-dial was tried and only ever hung until its timeout, adding 2s
         // to every connect. becomeReady reports which path won.
-        let params = NWParameters(tls: nil, tcp: options)
+        let params = pairingSecret.map {
+            SecureTransport.parameters(keys: [(PairingIdentity.macID, $0)])
+        } ?? NWParameters(tls: nil, tcp: options)
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app
@@ -1515,6 +1538,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             case .failed(let error):
                 Log.info("connection failed: \(error)")
                 self.connectionReady = false
+                self.reportPairingRejection(error)
                 if case .posix(let code) = error, code == .ECONNREFUSED {
                     self.dialRefused()
                 }
@@ -1533,7 +1557,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let text = self.awaitingWake
                     ? "\(self.endpointName) is asleep — reconnects when it wakes…"
                     : "Waiting for receiver at \(self.endpointName)…"
-                Task { await self.status(text) }
+                if !self.reportPairingRejection(error) {
+                    Task { await self.status(text) }
+                }
                 self.scheduleReconnect()
             case .cancelled:
                 self.connectionReady = false

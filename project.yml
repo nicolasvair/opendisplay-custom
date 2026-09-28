@@ -183,7 +183,7 @@ targets:
     info:
       path: iOS/Info.plist
       properties:
-        CFBundleDisplayName: OpenDisplay
+        CFBundleDisplayName: OpenDisplay Custom
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -198,6 +198,9 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios
+        # Custom fork: its own bundle so it installs next to (not over) the
+        # App Store app, signed with the personal team.
+        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios.custom
+        DEVELOPMENT_TEAM: 8ZMVCPUWKW
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
