@@ -77,6 +77,7 @@ final class LocalControls: ObservableObject {
 // MARK: - Bar
 
 struct LocalControlBar: View {
+    @ObservedObject var receiver: StreamReceiver
     @ObservedObject var controls = LocalControls.shared
 
     var body: some View {
@@ -98,6 +99,17 @@ struct LocalControlBar: View {
                 Image(systemName: "hare").foregroundColor(.gray)
             }
             Spacer()
+            // Only shown to a sender that announces its mode (this fork).
+            if let current = receiver.senderMode {
+                Picker("", selection: Binding(get: { current },
+                                              set: { receiver.requestMode($0) })) {
+                    Text("Étendre").tag("extend")
+                    Text("Recopie").tag("mirror")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 180)
+            }
             Picker("", selection: $controls.mode) {
                 Label("Tactile", systemImage: "hand.point.up").tag(LocalPointerMode.touch)
                 Label("Souris", systemImage: "rectangle.and.hand.point.up.left").tag(LocalPointerMode.trackpad)

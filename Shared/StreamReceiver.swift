@@ -921,6 +921,9 @@ final class StreamReceiver: ObservableObject {
             let height = obj["height"] as? Int ?? 0
             let fps = obj["framesPerSecond"] as? Int ?? 0
             Log.info("stream configuration: H.264 \(width)x\(height) @\(fps)fps")
+            if let mode = obj["mode"] as? String {
+                DispatchQueue.main.async { self.senderMode = mode }
+            }
         case WireMessage.updateRequired:
             // The Mac refuses this pairing until we update from the App Store.
             let message = obj["message"] as? String
@@ -1103,6 +1106,14 @@ final class StreamReceiver: ObservableObject {
     }
 
     // Custom local-controls messages (see `localControls`).
+
+    /// The sender's capture mode ("extend"/"mirror"), when it announces it.
+    @Published var senderMode: String?
+
+    /// Ask the Mac to switch between extending and mirroring.
+    func requestMode(_ mode: String) {
+        sendControl(["type": "setMode", "mode": mode])
+    }
 
     /// Relative pointer move in desktop points, acceleration already applied.
     func sendPointer(dx: Double, dy: Double) {

@@ -189,7 +189,14 @@ final class SenderController: ObservableObject {
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
     @Published var port = UserDefaults.standard.string(forKey: "port") ?? "9000"
     // `-mode mirror` / `-mode extend` launch argument also works.
-    @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend
+    // Remembered across launches; a change (from here or a receiver's
+    // switch) rebuilds every session in the new mode.
+    @Published var mode = CaptureMode(rawValue: UserDefaults.standard.string(forKey: "mode") ?? "") ?? .extend {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: "mode")
+            if mode != oldValue { restartAll() }
+        }
+    }
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
@@ -657,6 +664,10 @@ final class SenderController: ObservableObject {
             Log.info("session \(session.id) capture stopped via the system UI — honoring as disconnect")
             self.disconnect(session)
         }
+        sender.onModeRequested = { [weak self] mode in
+            Log.info("receiver asked for \(mode.rawValue) mode")
+            self?.mode = mode
+        }
         sender.onDisplayIdentityBumped = { [weak session] totalOffset in
             // The sender reports the validated absolute offset — store it
             // as-is. Adding would double-count when a rotation rebuild
@@ -944,7 +955,6 @@ struct ContentView: View {
                     Text("Mirror").tag(CaptureMode.mirror)
                 }
                 .pickerStyle(.segmented)
-                .onChange(of: controller.mode) { controller.restartAll() }
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Quality", selection: $controller.quality) {

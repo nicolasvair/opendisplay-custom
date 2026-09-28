@@ -89,7 +89,7 @@ struct ReceiverScreen: View {
                             .animation(controls.animateShift ? .easeOut(duration: 0.25) : nil,
                                        value: controls.keyboardShift)
                             .overlay(MacKeysRow(), alignment: .bottom)
-                        LocalControlBar()
+                        LocalControlBar(receiver: model.receiver)
                     }
                     .ignoresSafeArea()
                     if showAnalytics {

@@ -20,6 +20,7 @@
 >   - Trackpad mode run on the iPad: macOS-like acceleration with a speed
 >     slider, tap / double / triple click, two-finger tap right click,
 >     two-finger scroll with momentum, three-finger drag.
+>   - Extend / Mirror switch in the bar (the Mac rebuilds the session).
 >   - "Décaler": while a docked keyboard is up, the picture slides up and
 >     follows the cursor RealVNC-style, so the keyboard never hides the work.
 > - **Mac sender.**
@@ -27,6 +28,9 @@
 >     receivers without local controls).
 >   - The trackpad-mode cursor can move onto other displays.
 >   - Remembered WiFi devices reconnect automatically after the iPad sleeps.
+>   - The Extend / Mirror choice is remembered across launches.
+>   - Mirror capture restarts on its own when macOS stops it (it used to
+>     stay frozen; Extend already recovered).
 > - **Build.** Separate bundle IDs and names ("OpenDisplay Custom",
 >   "OpenDisplay Receiver Custom") so it installs next to the official apps;
 >   Sparkle auto-update disabled; `build-release.sh` builds, signs with a

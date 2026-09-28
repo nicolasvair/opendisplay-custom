@@ -88,6 +88,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // the session — teardown plus auto-connect opt-out — so the app honors
     // the stop instead of fighting it.
     @MainActor var onCaptureStoppedByUser: (() -> Void)?
+    /// A receiver's Extend/Mirror switch (custom local controls).
+    @MainActor var onModeRequested: ((CaptureMode) -> Void)?
     // Fired when the device's display identity had to be abandoned (macOS
     // saved hostile state for it — see setupExtend) and a bumped identity
     // came online instead: carries the validated TOTAL offset from the
@@ -1135,7 +1137,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Task { await status("Capture stopped: \(error.localizedDescription)") }
         // E.g. display sleep can tear the virtual display down underneath the
         // stream — rebuild instead of sitting dead until an app restart.
-        guard !stopped, mode == .extend else { return }
+        // Mirror too (custom): macOS also stops a main-display capture on its
+        // own (-3821), and without this the picture stayed frozen for good.
+        guard !stopped else { return }
         invalidateCapturePipeline()
         self.stream = nil
         scheduleCaptureRecovery()
@@ -2125,6 +2129,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let mods = obj["mods"] as? Int ?? 0
                 DispatchQueue.main.async { KeyPoster.shared.type(text, flags: KeyPoster.flags(mods)) }
             }
+        case "setMode":
+            if let raw = obj["mode"] as? String, let requested = CaptureMode(rawValue: raw),
+               requested != mode {
+                Task { @MainActor in self.onModeRequested?(requested) }
+            }
         case "key":
             if let code = obj["code"] as? Int, (0..<128).contains(code) {
                 let mods = obj["mods"] as? Int ?? 0
@@ -2601,6 +2610,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             "width": configuration.encodedSize.width,
             "height": configuration.encodedSize.height,
             "framesPerSecond": configuration.framesPerSecond,
+            "mode": mode.rawValue,   // custom: shown by the receiver's switch
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: selected),
               let json = String(data: data, encoding: .utf8) else { return }
