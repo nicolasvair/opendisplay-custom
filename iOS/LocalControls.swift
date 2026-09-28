@@ -25,6 +25,18 @@ final class LocalControls: ObservableObject {
     /// Touch mode: the next tap becomes a right click, then it disarms.
     @Published var rightClickArmed = false
     @Published var keyboardVisible = false
+    /// While a docked keyboard is up, slide the picture up so it does not
+    /// hide what is being worked on (trackpad mode follows the cursor).
+    @Published var followKeyboard = UserDefaults.standard.bool(forKey: "followKeyboard") {
+        didSet { UserDefaults.standard.set(followKeyboard, forKey: "followKeyboard") }
+    }
+    /// How far (points) the picture is currently slid up; the video view
+    /// computes it, the screen applies it as an offset.
+    @Published var keyboardShift: CGFloat = 0
+    /// Whether the latest shift change should animate.
+    var animateShift = false
+    /// Height the Mac keys row takes above the bar or the keyboard.
+    static let keysRowHeight: CGFloat = 54
     /// Sticky one-shot modifiers from the Mac keys row (1 ⌘, 2 ⌥, 4 ⌃, 8 ⇧).
     @Published var mods = 0
     /// Height of a docked keyboard (0 when hidden or floating), so the keys
@@ -71,6 +83,9 @@ struct LocalControlBar: View {
         HStack(spacing: 12) {
             barButton(systemImage: "keyboard", active: controls.keyboardVisible) {
                 controls.keyboardVisible.toggle()
+            }
+            barButton(title: "Décaler", active: controls.followKeyboard) {
+                controls.followKeyboard.toggle()
             }
             if controls.mode == .touch {
                 barButton(title: "Clic droit", active: controls.rightClickArmed) {
@@ -246,7 +261,9 @@ final class TrackpadEngine {
 
     func began(_ touches: Set<UITouch>, all: Set<UITouch>) {
         stopMomentum()
-        for t in touches { last[ObjectIdentifier(t)] = (t.location(in: t.view), t.timestamp) }
+        // Window coordinates: the video view itself slides with the keyboard
+        // shift, and a still finger must not read as a move when it does.
+        for t in touches { last[ObjectIdentifier(t)] = (t.location(in: nil), t.timestamp) }
         let count = last.count
         if gesture == .none {
             gesture = .pointing
@@ -275,7 +292,7 @@ final class TrackpadEngine {
             let id = ObjectIdentifier(t)
             guard let prev = last[id] else { continue }
             let newest = event?.coalescedTouches(for: t)?.last ?? t
-            let p = newest.location(in: t.view)
+            let p = newest.location(in: nil)
             deltas.append(CGPoint(x: p.x - prev.point.x, y: p.y - prev.point.y))
             dt = max(dt, newest.timestamp - prev.time)
             last[id] = (p, newest.timestamp)

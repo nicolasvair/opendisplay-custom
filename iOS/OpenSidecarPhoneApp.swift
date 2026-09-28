@@ -38,6 +38,7 @@ extension UIWindow {
 struct ReceiverScreen: View {
     @StateObject private var model = ReceiverModel()
     @StateObject private var versionGate = VersionGate()
+    @ObservedObject private var controls = LocalControls.shared
     @State private var showSettings = false
     @State private var showOnboarding = false
     @State private var nagDismissed = false
@@ -80,6 +81,13 @@ struct ReceiverScreen: View {
                                        receiver: model.receiver,
                                        useMetal: metalRenderer)
                             .id(metalRenderer)   // rebuild the layer tree on toggle
+                            // Slide clear of a docked keyboard ("Décaler").
+                            // Before the overlay, so the keys row stays put.
+                            .offset(y: -controls.keyboardShift)
+                            // Glide when the keyboard comes or goes; track
+                            // the cursor frame by frame.
+                            .animation(controls.animateShift ? .easeOut(duration: 0.25) : nil,
+                                       value: controls.keyboardShift)
                             .overlay(MacKeysRow(), alignment: .bottom)
                         LocalControlBar()
                     }
@@ -757,6 +765,13 @@ struct VideoLayerView: UIViewRepresentable {
                     else if self.keyInput.isFirstResponder { _ = self.keyInput.resignFirstResponder() }
                 }
                 .store(in: &localCancellables)
+            // @Published fires before the value changes: read it next turn.
+            controls.$dockedKeyboardHeight.map { _ in () }
+                .merge(with: controls.$keyboardVisible.map { _ in () },
+                       controls.$followKeyboard.map { _ in () })
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] in self?.updateKeyboardShift() }
+                .store(in: &localCancellables)
             controls.$mode
                 .sink { [weak self] mode in
                     // Trackpad mode reads raw touches; the pan recognizer
@@ -829,6 +844,49 @@ struct VideoLayerView: UIViewRepresentable {
             cursorLayer.isHidden = !visible || cursorLayer.contents == nil
             updateCursorLayout()
             CATransaction.commit()
+            if LocalControls.shared.mode == .trackpad { updateKeyboardShift(animated: false) }
+        }
+
+        // MARK: Keyboard shift
+
+        /// Past this fraction of the visible height from either edge, the
+        /// picture follows the cursor.
+        private let followMargin: CGFloat = 0.4
+
+        /// Works out how far to slide the picture so the cursor stays in view
+        /// above a docked keyboard; ReceiverScreen applies it as an offset
+        /// (bounds, and so the cursor's position here, are unaffected by it).
+        /// Trackpad mode calls this on every cursor move; touch mode only when
+        /// the keyboard comes or goes, so the picture holds still under taps.
+        func updateKeyboardShift(animated: Bool = true) {
+            let controls = LocalControls.shared
+            let current = controls.keyboardShift
+            var target: CGFloat = 0
+            if controls.followKeyboard, controls.keyboardVisible, controls.dockedKeyboardHeight > 0 {
+                let hidden = max(0, controls.dockedKeyboardHeight - LocalControls.barHeight)
+                    + LocalControls.keysRowHeight
+                let visible = bounds.height - hidden
+                if visible > 0, let rect = videoRect() {
+                    // Like RealVNC: the cursor roams freely in the middle of
+                    // the visible part; once within 40% of its top or bottom
+                    // edge, the picture is pushed along with it, until the
+                    // desktop's own edge is reached.
+                    let cursorY = rect.minY + cursorNorm.y * rect.height
+                    let margin = visible * followMargin
+                    target = current
+                    if cursorY < target + margin { target = cursorY - margin }
+                    if cursorY > target + visible - margin { target = cursorY - visible + margin }
+                    target = min(max(target, 0), hidden)
+                }
+            }
+            guard abs(target - current) > 0.5 || (target == 0 && current != 0) else { return }
+            if abs(target - current) > 20 || target == 0 {
+                Log.info("keyboard shift: \(Int(current)) -> \(Int(target))"
+                         + " docked=\(Int(controls.dockedKeyboardHeight))"
+                         + " windowY=\(Int(convert(bounds, to: nil).minY))")
+            }
+            controls.animateShift = animated
+            controls.keyboardShift = target
         }
 
         func setCursorSprite(_ image: CGImage, anchor: CGPoint, normSize: CGSize) {
