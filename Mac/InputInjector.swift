@@ -225,8 +225,9 @@ final class InputInjector {
                 postMouse(.leftMouseDown, at: pad.cursor, clickState: 1)
             }
             let g = trackpadGain
-            pad.cursor.x = min(max(pad.cursor.x + dx * g, bounds.minX), bounds.maxX - 1)
-            pad.cursor.y = min(max(pad.cursor.y + dy * g, bounds.minY), bounds.maxY - 1)
+            pad.cursor = desktopPoint(from: pad.cursor,
+                                      to: CGPoint(x: pad.cursor.x + dx * g, y: pad.cursor.y + dy * g),
+                                      fallback: bounds)
             postMouse(pad.dragging ? .leftMouseDragged : .mouseMoved, at: pad.cursor, clickState: 0)
         case "began":
             // Finger committed; its coordinates are the landing point, already past.
@@ -461,5 +462,21 @@ final class InputInjector {
 
     private func currentCursor() -> CGPoint {
         CGEvent(source: source)?.location ?? .zero
+    }
+
+    /// Moves the trackpad cursor across the whole desktop, like a real mouse:
+    /// it may leave the streamed display for any other active one and only
+    /// stops at the desktop's outer edges.
+    private func desktopPoint(from old: CGPoint, to target: CGPoint, fallback: CGRect) -> CGPoint {
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetActiveDisplayList(count, &ids, &count)
+        let screens = ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+        if screens.contains(where: { $0.contains(target) }) { return target }
+        // Off every screen: slide along the edge on the screen the cursor is on.
+        let home = screens.first(where: { $0.contains(old) }) ?? fallback
+        return CGPoint(x: min(max(target.x, home.minX), home.maxX - 1),
+                       y: min(max(target.y, home.minY), home.maxY - 1))
     }
 }
