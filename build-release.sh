@@ -20,7 +20,7 @@ SRC="build/Build/Products/Release/$APP_NAME.app"
 codesign --verify --deep --strict "$SRC"
 
 osascript -e "quit app id \"$BUNDLE_ID\"" 2>/dev/null || true
-while pgrep -f "$APP_NAME.app/Contents/MacOS" >/dev/null; do /bin/sleep 0.5; done
+while pgrep -f "^/Applications/$APP_NAME.app/Contents/MacOS/" >/dev/null; do /bin/sleep 0.5; done
 
 rm -rf "/Applications/$APP_NAME.app"
 ditto "$SRC" "/Applications/$APP_NAME.app"
