@@ -74,9 +74,11 @@ targets:
         SUEnableAutomaticChecks: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac
-        PRODUCT_NAME: OpenDisplay
-        BUNDLE_DISPLAY_NAME: OpenDisplay
+        # Custom fork: its own name and bundle ID so it never collides with
+        # the official OpenDisplay app (TCC grants, Launch Services, logs).
+        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.custom
+        PRODUCT_NAME: OpenDisplay Custom
+        BUNDLE_DISPLAY_NAME: OpenDisplay Custom
         SWIFT_OBJC_BRIDGING_HEADER: Mac/OpenSidecarMac-Bridging-Header.h
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
