@@ -1,3 +1,36 @@
+> [!NOTE]
+> **Minimal fork for personal needs** of [peetzweg/opendisplay](https://github.com/peetzweg/opendisplay).
+> Not affiliated with the official app, no support, no releases — build it
+> yourself. The changes live on the `custom` branch; `main` tracks upstream.
+>
+> **Changes from the official version**
+>
+> - **Encrypted pairing.** A Mac and a receiver pair once with a 6-digit code
+>   shown on the receiver and typed on the Mac (Curve25519 key exchange,
+>   commit/reveal, HMAC confirmation). WiFi then runs only over TLS 1.2 PSK;
+>   unpaired WiFi devices are refused. USB stays plaintext. Works for the iPad
+>   and the Mac receiver; pairings are kept in the Keychain and can be forgotten.
+> - **Local controls on the iPad.** The control bar lives on the iPad, in
+>   space reserved below the picture (the desktop is announced that much
+>   shorter).
+>   - iPadOS system keyboard (can float) with a Mac keys row: sticky ⌘ ⌥ ⌃ ⇧,
+>     Esc, Tab, arrows, forward delete.
+>   - Touch mode with a one-shot right click.
+>   - Trackpad mode run on the iPad: macOS-like acceleration with a speed
+>     slider, tap / double / triple click, two-finger tap right click,
+>     two-finger scroll with momentum, three-finger drag.
+>   - "Décaler": while a docked keyboard is up, the picture slides up and
+>     follows the cursor RealVNC-style, so the keyboard never hides the work.
+> - **Mac sender.**
+>   - Control bar and on-screen keyboard for mirror and extend modes (for
+>     receivers without local controls).
+>   - The trackpad-mode cursor can move onto other displays.
+>   - Remembered WiFi devices reconnect automatically after the iPad sleeps.
+> - **Build.** Separate bundle IDs and names ("OpenDisplay Custom",
+>   "OpenDisplay Receiver Custom") so it installs next to the official apps;
+>   Sparkle auto-update disabled; `build-release.sh` builds, signs with a
+>   Developer ID and installs the Mac app.
+
 <div align="center">
 
 <img src="public/logo.png" width="128" alt="OpenDisplay app icon" />
