@@ -232,12 +232,11 @@ final class SenderController: ObservableObject {
         || UserDefaults.standard.bool(forKey: "autostart")
 
     // Bonjour usually reports devices before usbmuxd does — WiFi reconnects
-    // wait out this window so a cabled device is dialed over USB first. The
-    // deadline closes the window for good: a remembered WiFi device that
-    // appears later was brought near the Mac mid-session, which is a user
-    // action to confirm, not auto-grab.
+    // wait out this window so a cabled device is dialed over USB first. After
+    // it, a remembered WiFi device (connected before, never disconnected by
+    // the user) is dialed whenever its service shows up — e.g. the receiver
+    // app reopened after the iPad slept.
     private var wifiAutoConnectArmed = false
-    private let wifiAutoConnectDeadline = Date().addingTimeInterval(12)
 
     init() {
         startBrowsing()
@@ -346,7 +345,7 @@ final class SenderController: ObservableObject {
                 connect(to: .usb(udid: device.udid))
             }
         }
-        guard wifiAutoConnectArmed, Date() < wifiAutoConnectDeadline else { return }
+        guard wifiAutoConnectArmed else { return }
         for result in discovered {
             let target = ConnectionTarget.wifi(result)
             if wifiRemembered.contains(target.sessionID),
@@ -574,10 +573,18 @@ final class SenderController: ObservableObject {
         sender.onDisconnected = { [weak self, weak session] in
             // Device unplugged / left the network and stayed gone: end this
             // session fully (virtual display + capture + indicator). No
-            // transport fallback — reconnecting is the user's call.
+            // transport fallback.
             guard let self, let session else { return }
             Log.info("device disconnected — session \(session.id) stopped")
             self.end(session)
+            // A remembered WiFi device most likely went to sleep and dropped
+            // off the network: wait for it patiently, like after an announced
+            // sleep, so it reconnects on its own when it wakes. The waiting
+            // session holds no display until the receiver says hello again.
+            if case .wifi = session.target, self.wifiRemembered.contains(session.id) {
+                Log.info("session \(session.id) remembered — waiting for the device to come back")
+                self.connect(to: session.target, awaitingWake: true)
+            }
         }
         sender.onPeerSleeping = { [weak self, weak session] in
             // The device locked. Unlike a plain disconnect this is a

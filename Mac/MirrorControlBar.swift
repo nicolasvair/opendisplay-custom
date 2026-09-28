@@ -85,50 +85,88 @@ final class PointerModeState {
     }
 }
 
-/// A black strip along the bottom of the mirrored display. It is a real
-/// window on the Mac, so Mirror mode streams it to the receiver like any other
-/// pixel and a finger on it is an ordinary click — no receiver change needed.
+/// A black strip along the bottom of the streamed display (the mirrored Mac
+/// screen, or the iPad's virtual display in Extend). It is a real window on
+/// the Mac, so it streams to the receiver like any other pixel and a finger
+/// on it is an ordinary click — no receiver change needed.
 @MainActor
 enum MirrorControlBar {
     static let height: CGFloat = 44
 
     private static var panel: NSPanel?
+    private static var displayID: CGDirectDisplayID?
+    private static var screenObserver: NSObjectProtocol?
     private static let model = MirrorBarModel()
 
     static func show(on displayID: CGDirectDisplayID) {
         hide()
         guard UserDefaults.standard.object(forKey: "mirrorControlBar") as? Bool ?? true else { return }
+        self.displayID = displayID
+        place(attempt: 0)
+        // Re-placed when screens change: a display rearranged, resized or
+        // (in Extend) the virtual display coming online a moment late.
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { _ in
+            Task { @MainActor in place(attempt: 0) }
+        }
+    }
+
+    /// A freshly created virtual display can reach NSScreen a little after
+    /// its capture starts — retry briefly before giving up.
+    private static func place(attempt: Int) {
+        guard let displayID else { return }
         guard let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
         }) else {
-            Log.info("mirror bar: no screen for display \(displayID)")
+            if attempt < 10 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    Task { @MainActor in place(attempt: attempt + 1) }
+                }
+            } else {
+                Log.info("control bar: no screen for display \(displayID)")
+            }
             return
         }
         let frame = NSRect(x: screen.frame.minX, y: screen.frame.minY,
                            width: screen.frame.width, height: height)
-        let p = NSPanel(contentRect: frame,
-                        styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
-        p.level = .statusBar   // above the Dock
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        p.isFloatingPanel = true
-        p.hidesOnDeactivate = false
-        p.becomesKeyOnlyIfNeeded = true
-        p.backgroundColor = .black
-        p.hasShadow = false
-        p.contentView = FirstMouseHostingView(rootView: MirrorBarView(model: model))
-        p.setFrame(frame, display: true)
-        p.orderFrontRegardless()
-        panel = p
+        if let panel {
+            panel.setFrame(frame, display: true)
+        } else {
+            let p = NSPanel(contentRect: frame,
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+            p.level = .statusBar   // above the Dock
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            p.isFloatingPanel = true
+            p.hidesOnDeactivate = false
+            p.becomesKeyOnlyIfNeeded = true
+            p.backgroundColor = .black
+            p.hasShadow = false
+            p.contentView = FirstMouseHostingView(rootView: MirrorBarView(model: model))
+            p.setFrame(frame, display: true)
+            p.orderFrontRegardless()
+            panel = p
+            OnScreenKeyboard.attach(to: displayID)
+            Log.info("control bar shown on display \(displayID)")
+        }
 
         let bounds = CGDisplayBounds(displayID)
         PointerModeState.shared.barRect = CGRect(x: bounds.minX, y: bounds.maxY - height,
                                                  width: bounds.width, height: height)
-        OnScreenKeyboard.attach(to: displayID)
-        Log.info("mirror bar shown on display \(displayID)")
+    }
+
+    /// Hides the bar only if it is on `displayID` — a session ending must not
+    /// take down the bar another device's session is showing.
+    static func hide(ifOn displayID: CGDirectDisplayID) {
+        guard displayID != 0, self.displayID == displayID else { return }
+        hide()
     }
 
     static func hide() {
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        screenObserver = nil
+        displayID = nil
         OnScreenKeyboard.detach()
         panel?.orderOut(nil)
         panel = nil

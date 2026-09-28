@@ -389,8 +389,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             try await startCapture(display: display,
                                    sourcePixelsWide: pixelsW, sourcePixelsHigh: pixelsH,
                                    receiver: info)
-            let barDisplayID = display.displayID
-            await MainActor.run { MirrorControlBar.show(on: barDisplayID) }
 
             // Same Accessibility wait as Extend: without trust, macOS drops the
             // synthetic events silently and touch looks dead.
@@ -918,6 +916,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             throw error
         }
         captureDisplayID = display.displayID
+        // The control bar lives on the streamed display — the mirrored Mac
+        // screen, or the iPad's virtual display in Extend.
+        let barDisplayID = display.displayID
+        await MainActor.run { MirrorControlBar.show(on: barDisplayID) }
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         startCursorEcho()
         // A capture that came back through any path (recovery, rotation,
@@ -933,9 +935,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         stopped = true
-        if mode == .mirror {
-            Task { @MainActor in MirrorControlBar.hide() }
-        }
+        // Only this session's bar: another device's session may own it.
+        let barDisplayID = captureDisplayID
+        Task { @MainActor in MirrorControlBar.hide(ifOn: barDisplayID) }
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
         cursorImageTimer?.cancel()
