@@ -205,6 +205,7 @@ final class SenderController: ObservableObject {
 
     private var browser: NWBrowser?
     private var usbWatcher: UsbmuxDeviceWatcher?
+    private var wakeObservers: [NSObjectProtocol] = []
 
     // Connection policy — one session per physical device, and the cable
     // wins whenever it's available (lower, steadier latency than WiFi):
@@ -259,6 +260,35 @@ final class SenderController: ObservableObject {
             self.wifiAutoConnectArmed = true
             self.autoConnect()
         }
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            wakeObservers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated { self?.macDidWake(note.name.rawValue) }
+            })
+        }
+    }
+
+    /// The Mac (or just its screens) woke up. Nothing else would make the
+    /// controller look again: auto-connect only runs on browse/USB events,
+    /// and a receiver whose advertisement never changed produces none — so
+    /// a session that failed while the screens slept stayed dead until the
+    /// receiver app was relaunched. Browse afresh (mDNS state rarely survives
+    /// a system sleep intact), then re-run auto-connect, which replaces
+    /// failed sessions and dials remembered devices.
+    private func macDidWake(_ reason: String) {
+        Log.info("\(reason) — refreshing discovery and reconnecting")
+        if reason == NSWorkspace.didWakeNotification.rawValue { restartBrowsing() }
+        Task { @MainActor in
+            // Let the network and WindowServer settle before dialing.
+            try? await Task.sleep(for: .seconds(2))
+            self.autoConnect()
+        }
+    }
+
+    private func restartBrowsing() {
+        browser?.cancel()
+        browser = nil
+        startBrowsing()
     }
 
     // MARK: - Pairing (Shared/Pairing.swift)
@@ -307,8 +337,15 @@ final class SenderController: ObservableObject {
                 self.autoConnect()
             }
         }
-        browser.stateUpdateHandler = { state in
-            if case .failed(let error) = state { Log.info("browser failed: \(error)") }
+        browser.stateUpdateHandler = { [weak self, weak browser] state in
+            guard case .failed(let error) = state else { return }
+            Log.info("browser failed: \(error) — restarting")
+            // A dead browser freezes `discovered`: no more browse events, so
+            // no more auto-connect. Replace it (unless already replaced).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                guard let self, let browser, self.browser === browser else { return }
+                self.restartBrowsing()
+            }
         }
         browser.start(queue: .main)
         self.browser = browser
@@ -642,6 +679,12 @@ final class SenderController: ObservableObject {
             if case .wifi = session.target, self.wifiRemembered.contains(session.id) {
                 Log.info("session \(session.id) remembered — waiting for the device to come back")
                 self.connect(to: session.target, awaitingWake: true)
+            } else if case .usb = session.target, !session.onUSB,
+                      let result = self.wifiService(for: session) {
+                // A cabled session that had failed over to WiFi: same
+                // patience, over the transport it was last using.
+                Log.info("session \(session.id) was on WiFi — waiting for the device to come back")
+                self.connect(to: .wifi(result), awaitingWake: true)
             }
         }
         sender.onPeerSleeping = { [weak self, weak session] in

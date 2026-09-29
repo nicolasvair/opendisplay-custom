@@ -18,6 +18,7 @@ import VideoToolbox
 import Network
 import CoreMedia
 import AppKit
+import IOKit.pwr_mgt
 
 enum CaptureMode: String {
     case mirror   // main display (Milestone 1)
@@ -172,8 +173,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // (the user may start the Mac side first); once connected, a device that
     // stays gone past the grace ends the session via onDisconnected.
     private var everConnected = false
-    private var disconnectedSince: Date?
+    // Measured on the uptime clock, which stops while the Mac sleeps: a
+    // link that died on the way into sleep must get its full grace after
+    // wake, not be declared gone by the first tick of the wall clock.
+    private var disconnectedSince: TimeInterval?
     private let disconnectGraceSeconds: TimeInterval = 10
+    private var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
@@ -196,6 +201,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // failed recovery round, reset by a capture that comes back up. On
     // `queue`.
     private var captureRecoveryFailures = 0
+    // Held while a live receiver looks at the Mac's lock screen, which
+    // otherwise blanks itself after a few seconds (and takes the capture
+    // with it) no matter what the idle settings say. On `queue`.
+    private var lockScreenActivity: IOPMAssertionID = 0
     private let maxCaptureRecoveryFailures = 5
 
     // Consecutive actively-refused dials on a previously connected session.
@@ -379,11 +388,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // before the first encoder is created. Legacy receivers omit the
             // new fields and retain the existing H.264 behavior.
             let info = try await waitForHello()
-            let content = try await SCShareableContent.current
-            guard let display = content.displays.first else {
-                throw NSError(domain: "MacSender", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "no displays found"])
-            }
+            try await waitForScreensAwake()
+            let display = try await firstShareableDisplay()
             // Touch/scroll/Pencil land on the display being mirrored — the
             // same one the receiver's normalized coordinates describe.
             inputInjector = InputInjector(displayID: display.displayID)
@@ -421,6 +427,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 Task { await self.status(text) }
             }
             let info = try await waitForHello()
+            // Creating a virtual display under a sleeping WindowServer fails
+            // like a poisoned identity would — never probe identities then.
+            try await waitForScreensAwake()
             try await setupExtend(info)
 
             // Touch back-channel (Milestone 3). Needs Accessibility trust;
@@ -651,6 +660,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // display, but never for a rotation: it belongs to the retired
             // desktop and can otherwise be replayed onto the new one.
             invalidateCapturePipeline(discardingLastFrame: true)
+            do { try await waitForScreensAwake() } catch { return }
             if let stream { try? await stream.stopCapture() }
             stream = nil
             if let encoder { VTCompressionSessionInvalidate(encoder) }
@@ -659,11 +669,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             do {
                 switch mode {
                 case .mirror:
-                    let content = try await SCShareableContent.current
-                    guard let display = content.displays.first else {
-                        throw NSError(domain: "MacSender", code: 1,
-                                      userInfo: [NSLocalizedDescriptionKey: "no display found"])
-                    }
+                    let display = try await firstShareableDisplay()
                     inputInjector = InputInjector(displayID: display.displayID)
                     let displayMode = CGDisplayCopyDisplayMode(display.displayID)
                     try await startCapture(
@@ -967,6 +973,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             self?.closeCursorChannel()
             self?.stopUpgradeProbing()
+            self?.releaseLockScreenActivity()
         }
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
@@ -1001,7 +1008,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // Fresh grace window: if the new link can't come up either, the
             // session ends like any other disconnect instead of dialing
             // a dead transport forever.
-            self.disconnectedSince = Date()
+            self.disconnectedSince = self.uptime
             self.connectionReady = false
             self.currentPathDirectLink = false   // the new transport re-classifies
             self.dialGeneration += 1   // a dial still in flight must not adopt
@@ -1113,7 +1120,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             Log.info("manual reconnect requested")
-            self.disconnectedSince = Date()   // fresh grace window
+            self.disconnectedSince = self.uptime   // fresh grace window
             self.scheduleReconnect()
         }
     }
@@ -1145,6 +1152,81 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         scheduleCaptureRecovery()
     }
 
+    /// The Mac's own screens are off (display sleep, or a wake still in
+    /// progress). WindowServer then reports no shareable displays and
+    /// refuses new virtual displays, so any pipeline built now fails.
+    static var screensAsleep: Bool { CGDisplayIsAsleep(CGMainDisplayID()) != 0 }
+
+    /// Hold the pipeline build until the Mac's screens are back — a receiver
+    /// that connects while they sleep would otherwise fail the session for
+    /// good ("no displays found") and nothing would retry it. The receiver
+    /// connecting is itself a sign someone is about to use the Mac, so light
+    /// the screens up like a mouse move would instead of waiting for one.
+    private func waitForScreensAwake() async throws {
+        guard Self.screensAsleep else { return }
+        Log.info("Mac screen asleep — waking it for \(endpointName)")
+        await status("Waking the Mac's screen…")
+        var assertion: IOPMAssertionID = 0
+        let declared = IOPMAssertionDeclareUserActivity(
+            "OpenDisplay receiver connected" as CFString, kIOPMUserActiveLocal, &assertion)
+        // Only held long enough to wake the screens — afterwards the normal
+        // idle timer applies again.
+        defer { if declared == kIOReturnSuccess { IOPMAssertionRelease(assertion) } }
+        if declared != kIOReturnSuccess {
+            Log.info("could not wake the screen (\(declared)) — waiting for it to wake")
+            await status("Mac screen is asleep — starts when it wakes…")
+        }
+        while Self.screensAsleep {
+            try await Task.sleep(for: .seconds(1))
+            if stopped { throw CancellationError() }
+        }
+        Log.info("Mac screen awake — resuming")
+    }
+
+    /// The display to mirror. Right after a wake the shareable content can
+    /// briefly come back empty, so give it a few seconds before failing.
+    private func firstShareableDisplay() async throws -> SCDisplay {
+        for attempt in 0..<10 {
+            if let display = try await SCShareableContent.current.displays.first { return display }
+            if stopped { throw CancellationError() }
+            if attempt == 0 { Log.info("no shareable display yet — retrying") }
+            try await Task.sleep(for: .seconds(1))
+        }
+        throw NSError(domain: "MacSender", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "no displays found"])
+    }
+
+    /// On `queue`, every watchdog tick: while the receiver is live and the
+    /// Mac sits at its lock screen, keep declaring user activity so the lock
+    /// screen stays visible on the device (and unlockable from it). Released
+    /// as soon as the session unlocks or the receiver goes quiet — a device
+    /// left open on a desk must not hold the Mac's screen on for good.
+    private func keepLockScreenLit() {
+        let receiverLive = connectionReady && Date().timeIntervalSince(lastReceived) < 5
+        guard receiverLive, Self.sessionLocked else {
+            releaseLockScreenActivity()
+            return
+        }
+        if lockScreenActivity == 0 { Log.info("Mac locked — keeping its lock screen lit for \(endpointName)") }
+        // Re-declaring with the same id refreshes the existing assertion.
+        let result = IOPMAssertionDeclareUserActivity(
+            "OpenDisplay receiver viewing the lock screen" as CFString,
+            kIOPMUserActiveLocal, &lockScreenActivity)
+        if result != kIOReturnSuccess { lockScreenActivity = 0 }
+    }
+
+    private func releaseLockScreenActivity() {
+        guard lockScreenActivity != 0 else { return }
+        IOPMAssertionRelease(lockScreenActivity)
+        lockScreenActivity = 0
+    }
+
+    /// The console session shows the lock screen.
+    static var sessionLocked: Bool {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        return info["CGSSessionScreenIsLocked"] as? Bool ?? false
+    }
+
     /// Retry until capture is back. Per issue #29 fix-plan point 1: a dead
     /// stream does NOT mean the display is gone. If our own virtual display
     /// still exists, just re-attach the capture to it — rebuilding the display
@@ -1155,6 +1237,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self, !self.stopped, self.stream == nil,
                   let hello = self.lastHello else { return }
+            // The Mac's screens are off: capture cannot come back yet, and a
+            // round spent now would only count toward giving up.
+            if Self.screensAsleep {
+                self.scheduleCaptureRecovery()
+                return
+            }
             // Does our virtual display still exist? CGDisplayBounds returns a
             // zero rect for an unknown id, so a non-empty bounds means it's live.
             // Test isEmpty, not isNull: isNull is only true for the special
@@ -1642,12 +1730,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !stopped else { return }
         if everConnected {
             if let since = disconnectedSince {
-                if Date().timeIntervalSince(since) > disconnectGraceSeconds {
+                if uptime - since > disconnectGraceSeconds {
                     reportGone("device gone for >\(Int(disconnectGraceSeconds))s — ending session")
                     return
                 }
             } else {
-                disconnectedSince = Date()
+                disconnectedSince = uptime
                 Task { await status("Connection lost — retrying for \(Int(disconnectGraceSeconds))s…") }
             }
         }
@@ -1724,7 +1812,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // Enforce it from here too, where the clock always ticks.
             if !self.connectionReady, self.everConnected,
                let since = self.disconnectedSince,
-               Date().timeIntervalSince(since) > self.disconnectGraceSeconds {
+               self.uptime - since > self.disconnectGraceSeconds {
                 self.reportGone("device gone for >\(Int(self.disconnectGraceSeconds))s — ending session")
             }
             // A reconnect on a static screen produces no capture frames, so
@@ -1736,6 +1824,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()),
                             generation: self.captureGenerationNow)
             }
+            self.keepLockScreenLit()
             self.scheduleWatchdog()
         }
     }
