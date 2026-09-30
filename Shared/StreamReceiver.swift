@@ -80,6 +80,9 @@ final class StreamReceiver: ObservableObject {
 
     private var listener: NWListener?
     private var listenerHealthy = false
+    private var wantsListener = false   // false after stop(); gates creation retries
+    private var closePending = false    // a closeSession is draining (queue only)
+    private var rearmAfterClose = false
     // Pairing (Shared/Pairing.swift): network sessions arrive only on this
     // TLS-PSK listener (base port + 2), up once a Mac is paired. The
     // plaintext listener serves USB (loopback) only and is not advertised.
@@ -364,6 +367,7 @@ final class StreamReceiver: ObservableObject {
     func start(port: UInt16 = 9000) {
         self.port = port
         queue.async {
+            self.wantsListener = true
             self.startListener()
             self.armLivenessTimers()
         }
@@ -376,6 +380,7 @@ final class StreamReceiver: ObservableObject {
     /// instance is discarded afterwards (start() re-arms if it isn't).
     func stop(completion: (() -> Void)? = nil) {
         queue.async {
+            self.wantsListener = false
             self.pingTimer?.cancel(); self.pingTimer = nil
             self.watchdogTimer?.cancel(); self.watchdogTimer = nil
             self.addrWatchTimer?.cancel(); self.addrWatchTimer = nil
@@ -391,7 +396,16 @@ final class StreamReceiver: ObservableObject {
     /// or enterSleep deliberately took it down on lock).
     func ensureListening() {
         queue.async {
-            guard !self.listenerHealthy else { return }
+            // A close (sleep) still draining would tear the listener down
+            // right after this; re-arm once it finishes instead.
+            if self.closePending { self.rearmAfterClose = true; return }
+            // Trust the listener's real state, not just our flag: a listener
+            // parked in .waiting (or left stale across a suspend) never
+            // delivers .failed, so listenerHealthy can stay true forever
+            // while nothing accepts the Mac's dials.
+            var ready = false
+            if let l = self.listener, case .ready = l.state { ready = true }
+            guard !(self.listenerHealthy && ready) else { return }
             Log.info("listener not healthy — restarting")
             self.restartListener()
         }
@@ -442,6 +456,7 @@ final class StreamReceiver: ObservableObject {
     private func closeSession(announcing type: String, status: String,
                               completion: (() -> Void)?) {
         queue.async {
+            self.closePending = true
             var finished = false
             let finish = { [weak self] in
                 guard let self, !finished else { return }
@@ -456,6 +471,13 @@ final class StreamReceiver: ObservableObject {
                 self.setConnected(false)
                 self.setStatus(status)
                 completion?()
+                self.closePending = false
+                if self.rearmAfterClose && self.wantsListener {
+                    self.rearmAfterClose = false
+                    Log.info("foregrounded during close — re-arming listener")
+                    self.restartListener()
+                }
+                self.rearmAfterClose = false
             }
             guard let conn = self.connection, conn.state == .ready else {
                 Log.info("closing session (\(type)) — no live connection")
@@ -600,7 +622,16 @@ final class StreamReceiver: ObservableObject {
             params.serviceClass = .interactiveVideo
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         } catch {
-            setStatus("Listener failed: \(error.localizedDescription)")
+            setStatus("Listener failed: \(error.localizedDescription) — retrying…")
+            Log.info("listener creation failed: \(error) — retrying in 2s")
+            listenerHealthy = false
+            // Only retry while a listener is still wanted (not after stop()).
+            if wantsListener {
+                queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    guard let self, self.wantsListener, self.listener == nil else { return }
+                    self.startListener()
+                }
+            }
             return
         }
         // Plaintext serves the cable only (usbmux dials the port directly),
@@ -615,8 +646,11 @@ final class StreamReceiver: ObservableObject {
             }
             self.accept(conn)
         }
+        let current = listener
         listener?.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            // A replaced listener's late .cancelled/.failed must not flip
+            // the flag (or trigger a restart) for its successor.
+            guard let self, self.listener === current else { return }
             switch state {
             case .ready:
                 self.listenerHealthy = true
@@ -625,7 +659,23 @@ final class StreamReceiver: ObservableObject {
                 Log.info("listener failed: \(error) — restarting in 1s")
                 self.listenerHealthy = false
                 self.setStatus("Listener failed — restarting…")
-                self.queue.asyncAfter(deadline: .now() + 1) { self.restartListener() }
+                self.queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    // Skip if a sleep/stop/restart already replaced it.
+                    guard let self, self.listener === current else { return }
+                    self.restartListener()
+                }
+            case .waiting(let error):
+                // Port or network not usable right now. NWListener may
+                // recover by itself, but after sleep/replug it often does
+                // not: give it a few seconds, then rebuild it.
+                Log.info("listener waiting: \(error)")
+                self.listenerHealthy = false
+                self.queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    guard let self, self.listener === current,
+                          !self.listenerHealthy else { return }
+                    Log.info("listener still waiting — restarting")
+                    self.restartListener()
+                }
             case .cancelled:
                 self.listenerHealthy = false
             default: break
@@ -1169,11 +1219,19 @@ final class StreamReceiver: ObservableObject {
                 self.drainFrames()
             }
             if let error {
-                Log.info("receive error: \(error)")
+                // The socket is dead (cable pulled, Mac slept, peer reset).
+                // Drop it so the session is not held "connected" and a fresh
+                // dial is adopted at once instead of parked as a twin.
+                Log.info("receive error: \(error) — dropping connection")
+                conn.cancel()
+                self.connection = nil
+                self.setConnected(false)
                 return
             }
             if isComplete {
                 Log.info("peer closed connection")
+                conn.cancel()
+                self.connection = nil
                 self.setConnected(false)
                 return
             }
