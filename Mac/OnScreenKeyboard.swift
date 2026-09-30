@@ -238,7 +238,11 @@ final class KeyPoster {
         return flags
     }
 
-    private let source = CGEventSource(stateID: .hidSystemState)
+    // Private state: flags set on these events (⇧ for a capital, ⌘ for a
+    // shortcut) must not leak into the system-wide modifier state, where they
+    // stayed "held" for the clicks the injector posts afterwards until a
+    // flag-less key such as Esc reset them.
+    private let source = CGEventSource(stateID: .privateState)
     private var map: [String: (code: CGKeyCode, shift: Bool)] = [:]
     private var mappedLayout: String?
 
