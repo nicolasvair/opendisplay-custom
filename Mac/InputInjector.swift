@@ -345,6 +345,68 @@ final class InputInjector {
         event.post(tap: .cghidEventTap)
     }
 
+    /// Zoom path switch. true: post real magnify gesture events (what a
+    /// trackpad pinch produces; works in any app that supports pinch-zoom, no
+    /// setup). false: Ctrl + scroll wheel, which macOS maps to zoom only when
+    /// System Settings > Accessibility > Zoom > "Use scroll gesture with
+    /// modifier keys" is on. The gesture path uses private CGEvent fields and is
+    /// unverified on hardware; it falls back to Ctrl+scroll per call if the
+    /// event cannot be built.
+    private static let useMagnifyGesture = true
+    private static let magnifyEventType = CGEventType(rawValue: 29)   // NSEventTypeMagnify
+    private var magnifyActive = false
+    private var lastMagnifyTime: CFAbsoluteTime = 0
+
+    /// delta: fractional magnification step (0.1 = +10%), 0 = gesture ended.
+    func handleMagnify(delta: Double) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if delta == 0 {
+            if magnifyActive { postMagnifyGesture(phase: 4, delta: 0) }
+            magnifyActive = false
+            return
+        }
+        guard delta.isFinite else { return }
+        if Self.useMagnifyGesture {
+            // A lost "ended" must not leave the gesture open forever.
+            if magnifyActive, now - lastMagnifyTime > 0.5 {
+                postMagnifyGesture(phase: 4, delta: 0)
+                magnifyActive = false
+            }
+            let phase: Int64 = magnifyActive ? 2 : 1   // NSEventPhase changed / began
+            if postMagnifyGesture(phase: phase, delta: delta) {
+                magnifyActive = true
+                lastMagnifyTime = now
+                return
+            }
+        }
+        // Fallback: Ctrl + scroll. Positive delta zooms in (wheel up).
+        guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
+                                  wheelCount: 1,
+                                  wheel1: Int32((delta * 300).rounded()),
+                                  wheel2: 0, wheel3: 0) else { return }
+        event.flags.insert(.maskControl)
+        event.post(tap: .cghidEventTap)
+    }
+
+    /// Private gesture event: type 29, subtype field 110 (8 = zoom), phase
+    /// field 132, magnification field 113. Returns false if it could not be built.
+    @discardableResult
+    private func postMagnifyGesture(phase: Int64, delta: Double) -> Bool {
+        guard let type = Self.magnifyEventType,
+              let event = CGEvent(source: source),
+              let subtypeField = CGEventField(rawValue: 110),
+              let phaseField = CGEventField(rawValue: 132),
+              let magnifyField = CGEventField(rawValue: 113) else { return false }
+        event.type = type
+        event.setIntegerValueField(subtypeField, value: 8)
+        event.setIntegerValueField(phaseField, value: phase)
+        event.setDoubleValueField(magnifyField, value: delta)
+        // Gestures go to the window under the cursor, like scroll.
+        event.location = CGEvent(source: nil)?.location ?? .zero
+        event.post(tap: .cghidEventTap)
+        return true
+    }
+
     func handleProximity(entering: Bool, x: Double, y: Double) {
         setProximity(entering: entering, at: screenPoint(nx: x, ny: y))
     }

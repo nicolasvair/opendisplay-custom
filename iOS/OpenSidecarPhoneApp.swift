@@ -711,7 +711,13 @@ struct VideoLayerView: UIViewRepresentable {
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
         view.addGestureRecognizer(pan)
-        view.installLocalControls(pan: pan)
+        // Pinch runs alongside the pan; the view lets them recognize together
+        // and suppresses scroll once the pinch dominates.
+        let pinch = UIPinchGestureRecognizer(target: view, action: #selector(VideoView.didPinch(_:)))
+        pinch.delegate = view
+        pan.delegate = view
+        view.addGestureRecognizer(pinch)
+        view.installLocalControls(pan: pan, pinch: pinch)
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -737,7 +743,7 @@ struct VideoLayerView: UIViewRepresentable {
         uiView.setNeedsLayout()
     }
 
-    final class VideoView: UIView {
+    final class VideoView: UIView, UIGestureRecognizerDelegate {
         weak var receiver: StreamReceiver?
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
@@ -746,7 +752,7 @@ struct VideoLayerView: UIViewRepresentable {
         private var localCancellables = Set<AnyCancellable>()
 
         /// Hooks the local keyboard and trackpad to the shared bar state.
-        func installLocalControls(pan: UIPanGestureRecognizer) {
+        func installLocalControls(pan: UIPanGestureRecognizer, pinch: UIPinchGestureRecognizer) {
             let controls = LocalControls.shared
             trackpad.receiver = receiver
             controls.receiver = receiver
@@ -777,6 +783,7 @@ struct VideoLayerView: UIViewRepresentable {
                     // Trackpad mode reads raw touches; the pan recognizer
                     // would cancel them to scroll on its own.
                     pan.isEnabled = mode == .touch
+                    pinch.isEnabled = mode == .touch   // trackpad mode detects pinch itself
                     self?.trackpad.reset()
                     controls.rightClickArmed = false
                 }
@@ -972,12 +979,47 @@ struct VideoLayerView: UIViewRepresentable {
             case .changed:
                 let t = recognizer.translation(in: self)
                 let scale = min(bounds.width / video.width, bounds.height / video.height)
-                // Deltas in video pixels, natural-scrolling direction.
-                receiver?.sendScroll(dx: (t.x - lastPan.x) / scale,
-                                     dy: (t.y - lastPan.y) / scale)
+                // Deltas in video pixels, natural-scrolling direction. A
+                // dominant pinch owns the gesture: no scroll alongside zoom.
+                if !pinchDominant {
+                    receiver?.sendScroll(dx: (t.x - lastPan.x) / scale,
+                                         dy: (t.y - lastPan.y) / scale)
+                }
                 lastPan = t
             default:
                 twoFingerActive = false
+            }
+        }
+
+        private var pinchDominant = false
+        private var pinchLastScale: CGFloat = 1
+        /// Scale change (fraction) before a pinch counts as deliberate; smaller
+        /// finger-spread drift during a two-finger scroll is ignored.
+        private let pinchThreshold: CGFloat = 0.06
+
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            (g is UIPinchGestureRecognizer && other is UIPanGestureRecognizer)
+                || (g is UIPanGestureRecognizer && other is UIPinchGestureRecognizer)
+        }
+
+        @objc func didPinch(_ recognizer: UIPinchGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                pinchDominant = false
+                pinchLastScale = 1
+            case .changed:
+                if !pinchDominant {
+                    guard abs(recognizer.scale - 1) > pinchThreshold else { return }
+                    pinchDominant = true
+                    pinchLastScale = recognizer.scale   // the dead zone is not sent
+                }
+                guard pinchLastScale > 0 else { return }
+                receiver?.sendMagnify(delta: Double(recognizer.scale / pinchLastScale - 1))
+                pinchLastScale = recognizer.scale
+            default:
+                if pinchDominant { receiver?.sendMagnify(delta: 0) }
+                pinchDominant = false
             }
         }
 

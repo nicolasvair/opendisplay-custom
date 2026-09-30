@@ -1134,6 +1134,11 @@ final class StreamReceiver: ObservableObject {
         sendControl(["type": "scroll", "dx": dx, "dy": dy])
     }
 
+    /// Pinch zoom: fractional magnification step (0.1 = +10%); 0 ends the gesture.
+    func sendMagnify(delta: Double) {
+        sendControl(["type": "magnify", "delta": delta])
+    }
+
     /// Apple Pencil stroke/hover. azimuth and altitude are radians.
     /// rotation is always 0 until Apple Pencil Pro barrel roll is wired up.
     func sendPencil(phase: String, x: Double, y: Double,

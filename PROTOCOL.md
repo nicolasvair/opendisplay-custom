@@ -251,6 +251,7 @@ Coordinates use the conventions of section 7.
 | `ping` | pv 1 | `t` | Liveness + clock sync probe |
 | `touch` | pv 1 | `phase`, `x`, `y`, `t`? | Finger input |
 | `scroll` | pv 1 | `dx`, `dy` | Two-finger scroll |
+| `magnify` | additive | `delta` | Pinch zoom |
 | `pencil` | pv 3 | `phase`, `x`, `y`, `pressure`, `azimuth`, `altitude`, `rotation`, `t`? | Stylus input |
 | `proximity` | pv 3 | `entering`, `x`, `y` | Stylus hover enter/leave |
 | `kf` | pv 1 | none | Request an IDR (section 5.3) |
@@ -316,6 +317,13 @@ known).
 pixels** (section 7) with **natural-scrolling sign** (content follows the
 fingers: fingers moving down produce positive `dy` and the scrolled content
 moves down).
+
+**`magnify`** (additive, no `pv` bump) carries `delta` (number): an
+incremental magnification step as a fraction (0.1 = zoom in 10%, negative
+zooms out). `delta` 0 means the pinch ended; senders also close a gesture
+that has been silent for 0.5 s. The official sender posts a macOS magnify
+gesture event (falling back to Ctrl + scroll wheel). Peers that predate it
+ignore the unknown type, as section 6 requires.
 
 **`pencil`** (pv 3) carries `phase` (string): `"down"`, `"move"`, `"up"`,
 or `"hover"`; `x`, `y`: normalized position; `pressure` (number): 0 to 1;

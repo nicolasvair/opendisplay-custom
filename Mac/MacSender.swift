@@ -2202,6 +2202,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handleScroll(dx: dx, dy: dy)
             }
+        case "magnify":
+            if let delta = obj["delta"] as? Double {
+                inputInjector?.handleMagnify(delta: delta)
+            }
         // Custom local-controls messages (receiver-side trackpad + keyboard).
         case "pointer":
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {

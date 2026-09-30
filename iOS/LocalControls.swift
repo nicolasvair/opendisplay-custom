@@ -257,6 +257,12 @@ final class TrackpadEngine {
     private var lastTapEnd: TimeInterval = 0
     private var tapCount = 0
     private var scrollSamples: [(time: TimeInterval, delta: CGPoint)] = []
+    // Pinch detection inside a two-finger gesture: finger spread vs centroid travel.
+    private var pinching = false
+    private var pinchSpread: CGFloat = 0     // current finger distance, points
+    private var pinchSpreadChange: CGFloat = 0
+    private var pinchPanTravel: CGFloat = 0
+    private let pinchStartSpread: CGFloat = 16   // points of spread change to latch
     private var momentum: CADisplayLink?
     private var momentumVelocity = CGPoint.zero   // video pixels per second
     private var lastMomentumTime: CFTimeInterval = 0
@@ -288,6 +294,10 @@ final class TrackpadEngine {
         case 2 where gesture == .pointing:
             gesture = .scrolling
             scrollSamples.removeAll()
+            pinching = false
+            pinchSpreadChange = 0
+            pinchPanTravel = 0
+            pinchSpread = fingerSpread()
         case 3... where gesture == .pointing || gesture == .scrolling:
             gesture = .dragging
             receiver?.sendButton(right: false, down: true)
@@ -323,6 +333,24 @@ final class TrackpadEngine {
             let g = gain(forSpeed: speed)
             receiver?.sendPointer(dx: Double(d.x * g), dy: Double(d.y * g))
         case .scrolling:
+            // Pinch vs scroll: latch into pinch once the spread changes by
+            // more than the centroid has travelled; it then replaces scroll.
+            let spread = fingerSpread()
+            if last.count == 2, pinchSpread > 0, spread > 0 {
+                let change = spread - pinchSpread
+                pinchSpread = spread
+                if pinching {
+                    receiver?.sendMagnify(delta: Double(change / (spread - change)))
+                    return
+                }
+                pinchSpreadChange += change
+                pinchPanTravel += distance
+                if abs(pinchSpreadChange) > pinchStartSpread, abs(pinchSpreadChange) > pinchPanTravel {
+                    pinching = true
+                    scrollSamples.removeAll()
+                    return
+                }
+            }
             let s = pointsPerVideoPixel()
             let px = CGPoint(x: d.x / s, y: d.y / s)
             receiver?.sendScroll(dx: Double(px.x), dy: Double(px.y))
@@ -334,8 +362,20 @@ final class TrackpadEngine {
         }
     }
 
+    /// Distance between the two fingers down (0 unless exactly two).
+    private func fingerSpread() -> CGFloat {
+        let points = last.values.map(\.point)
+        guard points.count == 2 else { return 0 }
+        return hypot(points[0].x - points[1].x, points[0].y - points[1].y)
+    }
+
     func ended(_ touches: Set<UITouch>, cancelled: Bool) {
         for t in touches { last.removeValue(forKey: ObjectIdentifier(t)) }
+        let wasPinching = pinching
+        if pinching {
+            pinching = false
+            receiver?.sendMagnify(delta: 0)
+        }
         guard last.isEmpty else {
             // Some fingers still down: a scroll or drag keeps its meaning,
             // but the leftover finger must not start steering the pointer.
@@ -355,10 +395,10 @@ final class TrackpadEngine {
             receiver?.sendButton(right: false, down: true, clicks: tapCount)
             receiver?.sendButton(right: false, down: false, clicks: tapCount)
         case .scrolling, .settling:
-            if isTap && maxFingers == 2 {
+            if isTap && maxFingers == 2 && !wasPinching {
                 receiver?.sendButton(right: true, down: true)
                 receiver?.sendButton(right: true, down: false)
-            } else if gesture == .scrolling, !cancelled {
+            } else if gesture == .scrolling, !cancelled, !wasPinching {
                 startMomentum()
             }
         default:
@@ -368,6 +408,8 @@ final class TrackpadEngine {
     }
 
     func reset() {
+        if pinching { receiver?.sendMagnify(delta: 0) }
+        pinching = false
         if gesture == .dragging { receiver?.sendButton(right: false, down: false) }
         last.removeAll()
         gesture = .none
