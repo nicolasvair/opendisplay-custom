@@ -867,15 +867,30 @@ struct VideoLayerView: UIViewRepresentable {
                     + LocalControls.keysRowHeight
                 let visible = bounds.height - hidden
                 if visible > 0, let rect = videoRect() {
-                    // Like RealVNC: the cursor roams freely in the middle of
-                    // the visible part; once within 40% of its top or bottom
-                    // edge, the picture is pushed along with it, until the
-                    // desktop's own edge is reached.
-                    let cursorY = rect.minY + cursorNorm.y * rect.height
-                    let margin = visible * followMargin
-                    target = current
-                    if cursorY < target + margin { target = cursorY - margin }
-                    if cursorY > target + visible - margin { target = cursorY - visible + margin }
+                    // The keyboard first covers the black letterbox bar under
+                    // the picture, so shift only as far as the picture itself
+                    // needs: its bottom edge must clear the keyboard (low),
+                    // and never slide further than its top edge reaching the
+                    // screen top (high) - that would only hide picture.
+                    let low = rect.maxY - visible
+                    let high = rect.minY
+                    if rect.height <= visible {
+                        // The whole picture fits above the keyboard: the
+                        // minimal shift (often none) and no cursor following.
+                        target = max(0, low)
+                    } else {
+                        // Taller than the visible part: the shift range is
+                        // [rect.minY, rect.maxY - visible] (both >= 0). Like
+                        // RealVNC, the cursor roams freely in the middle of
+                        // the visible part; within 40% of its top or bottom
+                        // edge, the picture is pushed along with it.
+                        let cursorY = rect.minY + cursorNorm.y * rect.height
+                        let margin = visible * followMargin
+                        target = current
+                        if cursorY < target + margin { target = cursorY - margin }
+                        if cursorY > target + visible - margin { target = cursorY - visible + margin }
+                        target = min(max(target, high), low)
+                    }
                     target = min(max(target, 0), hidden)
                 }
             }
