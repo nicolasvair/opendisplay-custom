@@ -345,14 +345,10 @@ final class InputInjector {
         event.post(tap: .cghidEventTap)
     }
 
-    /// Zoom path switch. true: post real magnify gesture events (what a
-    /// trackpad pinch produces; works in any app that supports pinch-zoom, no
-    /// setup). false: Ctrl + scroll wheel, which macOS maps to zoom only when
-    /// System Settings > Accessibility > Zoom > "Use scroll gesture with
-    /// modifier keys" is on. The gesture path uses private CGEvent fields and is
-    /// unverified on hardware; it falls back to Ctrl+scroll per call if the
-    /// event cannot be built.
-    private static let useMagnifyGesture = true
+    /// Pinch-to-zoom: real magnify gesture events (what a trackpad pinch
+    /// produces; works in any app that supports pinch-zoom). They use private
+    /// CGEvent fields and are unverified on hardware; if the event cannot be
+    /// built the pinch is ignored.
     private static let magnifyEventType = CGEventType(rawValue: 29)   // NSEventTypeMagnify
     private var magnifyActive = false
     private var lastMagnifyTime: CFAbsoluteTime = 0
@@ -366,26 +362,16 @@ final class InputInjector {
             return
         }
         guard delta.isFinite else { return }
-        if Self.useMagnifyGesture {
-            // A lost "ended" must not leave the gesture open forever.
-            if magnifyActive, now - lastMagnifyTime > 0.5 {
-                postMagnifyGesture(phase: 4, delta: 0)
-                magnifyActive = false
-            }
-            let phase: Int64 = magnifyActive ? 2 : 1   // NSEventPhase changed / began
-            if postMagnifyGesture(phase: phase, delta: delta) {
-                magnifyActive = true
-                lastMagnifyTime = now
-                return
-            }
+        // A lost "ended" must not leave the gesture open forever.
+        if magnifyActive, now - lastMagnifyTime > 0.5 {
+            postMagnifyGesture(phase: 4, delta: 0)
+            magnifyActive = false
         }
-        // Fallback: Ctrl + scroll. Positive delta zooms in (wheel up).
-        guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
-                                  wheelCount: 1,
-                                  wheel1: Int32((delta * 300).rounded()),
-                                  wheel2: 0, wheel3: 0) else { return }
-        event.flags.insert(.maskControl)
-        event.post(tap: .cghidEventTap)
+        let phase: Int64 = magnifyActive ? 2 : 1   // NSEventPhase changed / began
+        if postMagnifyGesture(phase: phase, delta: delta) {
+            magnifyActive = true
+            lastMagnifyTime = now
+        }
     }
 
     /// Private gesture event: type 29, subtype field 110 (8 = zoom), phase

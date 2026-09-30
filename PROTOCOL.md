@@ -322,7 +322,7 @@ moves down).
 incremental magnification step as a fraction (0.1 = zoom in 10%, negative
 zooms out). `delta` 0 means the pinch ended; senders also close a gesture
 that has been silent for 0.5 s. The official sender posts a macOS magnify
-gesture event (falling back to Ctrl + scroll wheel). Peers that predate it
+gesture event when the system supports it, otherwise ignores the pinch. Peers that predate it
 ignore the unknown type, as section 6 requires.
 
 **`pencil`** (pv 3) carries `phase` (string): `"down"`, `"move"`, `"up"`,
