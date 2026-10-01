@@ -122,8 +122,10 @@ struct LocalControlBar: View {
                     }
                 } else {
                     Image(systemName: "tortoise").foregroundColor(.gray)
+                    // Shrinks first when the bar is tight (portrait).
                     Slider(value: $controls.trackpadSpeed, in: 0.4...2.5)
-                        .frame(width: 140)
+                        .frame(minWidth: 40, maxWidth: 140)
+                        .layoutPriority(-1)
                     Image(systemName: "hare").foregroundColor(.gray)
                 }
                 Picker("", selection: $controls.mode) {
