@@ -154,11 +154,13 @@ targets:
     sources:
       - MacTests
       - Mac/DisplayArrangement.swift
+      - Mac/MirrorDisplaySelection.swift
       - Mac/StreamConfiguration.swift
       - Mac/VirtualCanvasSizing.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
+      - Shared/TextChunking.swift
       - Shared/LogSnapshot.swift
       - MacReceiver/FullscreenPreference.swift
     settings:

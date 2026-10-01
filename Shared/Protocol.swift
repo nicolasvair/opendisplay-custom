@@ -35,6 +35,20 @@ enum WireMessage {
     static let sleeping = "sleeping"                // phone -> Mac: device locked, reconnect on wake
     static let closing = "closing"                  // phone -> Mac: app quit, end the session for good
     static let streamConfig = "streamConfig"        // Mac -> receiver: selected video operating point
+    // Custom fork extensions (additive, no `pv` bump — see PROTOCOL.md "Fork extensions").
+    static let displays = "displays"                // Mac -> receiver: mirrorable screens + selection
+    static let setDisplay = "setDisplay"            // receiver -> Mac: pick the screen to mirror
+}
+
+/// One physical Mac screen a receiver may pick in Mirror mode. `id` is the
+/// CGDisplay UUID string, stable across reboots and display re-numbering.
+/// `w`/`h` are the screen's pixel size.
+struct MirrorDisplayInfo: Codable, Equatable {
+    let id: String
+    let name: String
+    let w: Int
+    let h: Int
+    let main: Bool
 }
 
 /// One receiver-supported operating envelope. Every non-nil limit in an

@@ -974,6 +974,19 @@ final class StreamReceiver: ObservableObject {
             if let mode = obj["mode"] as? String {
                 DispatchQueue.main.async { self.senderMode = mode }
             }
+        case WireMessage.displays:
+            // Custom: the Mac's mirrorable screens and the one in use. Shown
+            // by the local controls in Mirror mode; old/other receivers never
+            // see it as an error (unknown types fall through to `default`).
+            guard let rawList = obj["list"],
+                  let listData = try? JSONSerialization.data(withJSONObject: rawList),
+                  let list = try? JSONDecoder().decode([MirrorDisplayInfo].self, from: listData)
+            else { return }
+            let selected = obj["selected"] as? String
+            DispatchQueue.main.async {
+                self.macDisplays = list
+                self.selectedMacDisplay = selected
+            }
         case WireMessage.updateRequired:
             // The Mac refuses this pairing until we update from the App Store.
             let message = obj["message"] as? String
@@ -1164,6 +1177,17 @@ final class StreamReceiver: ObservableObject {
 
     /// The sender's capture mode ("extend"/"mirror"), when it announces it.
     @Published var senderMode: String?
+
+    /// The Mac's physical screens, as announced in `displays` (empty until
+    /// the Mac sends them, and after a disconnect).
+    @Published var macDisplays: [MirrorDisplayInfo] = []
+    /// CGDisplay UUID of the screen the Mac is mirroring.
+    @Published var selectedMacDisplay: String?
+
+    /// Ask the Mac to mirror another of its screens.
+    func requestDisplay(_ id: String) {
+        sendControl(["type": WireMessage.setDisplay, "id": id])
+    }
 
     /// Ask the Mac to switch between extending and mirroring.
     func requestMode(_ mode: String) {
@@ -1619,6 +1643,8 @@ final class StreamReceiver: ObservableObject {
             self.connected = value
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
+                self.macDisplays = []
+                self.selectedMacDisplay = nil
             }
         }
         if !value { setStatus("Listening on :9000") }

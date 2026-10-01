@@ -145,7 +145,8 @@ struct ReceiverScreen: View {
             Log.info("scenePhase -> \(String(describing: phase))")
             switch phase {
             case .active: model.sceneDidActivate()
-            case .background: model.sceneDidBackground()
+            case .background:
+                model.sceneDidBackground()
             default: break
             }
         }

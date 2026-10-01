@@ -197,6 +197,12 @@ final class SenderController: ObservableObject {
             if mode != oldValue { restartAll() }
         }
     }
+    // Mirror mode: CGDisplay UUID of the screen the iPad picked (nil = main
+    // screen). Remembered across launches; a pick made from the receiver
+    // updates it without rebuilding the sessions (the sender already switched).
+    @Published var mirrorDisplayID: String? = UserDefaults.standard.string(forKey: "mirrorDisplayID") {
+        didSet { UserDefaults.standard.set(mirrorDisplayID, forKey: "mirrorDisplayID") }
+    }
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
@@ -636,7 +642,8 @@ final class SenderController: ObservableObject {
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
-                               awaitingWake: awaitingWake)
+                               awaitingWake: awaitingWake,
+                               preferredMirrorDisplayID: mirrorDisplayID)
         sender.setPairingSecret(secret)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
@@ -710,6 +717,10 @@ final class SenderController: ObservableObject {
         sender.onModeRequested = { [weak self] mode in
             Log.info("receiver asked for \(mode.rawValue) mode")
             self?.mode = mode
+        }
+        sender.onMirrorDisplayChosen = { [weak self] id in
+            Log.info("receiver chose mirror screen \(id)")
+            self?.mirrorDisplayID = id
         }
         sender.onDisplayIdentityBumped = { [weak session] totalOffset in
             // The sender reports the validated absolute offset — store it

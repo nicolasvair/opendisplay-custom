@@ -559,6 +559,52 @@ During migration, a receiver MAY send both the legacy ceiling and
 do not replace sender validation: the sender must independently keep its H.264
 raster and rate within the selected encoder's constraints.
 
+### 6.6 Fork extensions (custom)
+
+The custom fork of the apps adds the messages below. They are **additive and
+need no `pv` bump**: a peer that does not know them ignores them (section 6),
+and a sender or receiver that never sends them simply gets the stock
+behavior. Receivers announce `hello.localControls: true` when they draw their
+own control bar and run the pointer logic themselves (trackpad mode).
+
+Receiver to sender:
+
+| `type` | Fields | Purpose |
+|---|---|---|
+| `setMode` | `mode` (`"extend"` or `"mirror"`) | Switch the sender between extending and mirroring; the sender rebuilds its sessions |
+| `pointer` | `dx`, `dy` | Relative pointer move, in desktop points, acceleration already applied by the receiver |
+| `button` | `button` (`"left"`/`"right"`), `down`, `clicks`?, `x`?, `y`? | Mouse button at the current cursor position (`x`, `y` optionally normalized, section 7); `clicks` defaults to 1 |
+| `text` | `s`, `mods`? | Text to type; `mods` bits: 1 command, 2 option, 4 control, 8 shift (default 0). The sender types any text that is not a single key of the current layout as Unicode, in pieces of at most 16 UTF-16 units per keyboard event |
+| `key` | `code`, `mods`? | A Mac virtual key code, 0..127 (Return is 36, Tab 48, Delete 51, arrows 123-126); same `mods` bits |
+| `setDisplay` | `id` | Mirror mode only: mirror the Mac screen whose CGDisplay UUID is `id` (from `displays`). Ignored in extend mode and for an unchanged `id` |
+
+Sender to receiver:
+
+| `type` | Fields | Purpose |
+|---|---|---|
+| `displays` | `list`, `selected`? | The Mac screens that can be mirrored and the one in use |
+| `streamConfig` | adds `mode` | In addition to the fields of section 6.5, the sender's current mode (`"extend"` or `"mirror"`), so the receiver can show its switch |
+
+**`displays`**: `list` is an array of `{"id", "name", "w", "h", "main"}`:
+`id` is the screen's CGDisplay UUID (stable across reboots and display
+renumbering), `name` its localized name, `w`/`h` its size in pixels, `main`
+whether it is the Mac's main screen. OpenDisplay's own virtual displays are
+left out. `selected` is the `id` currently mirrored (or about to be). The
+sender sends it after every `hello`, whenever a capture starts and when the
+Mac's screen configuration changes, in both modes; a receiver only needs to
+offer a picker while mirroring. Without a stored choice the sender mirrors
+the main screen, then the first one; a chosen screen that is unplugged falls
+back the same way without forgetting the choice.
+
+```json
+{"type":"displays","list":[{"id":"37D8832A-2D66-02CA-B9F7-8F30A301B230","name":"Built-in Retina Display","w":3024,"h":1964,"main":true}],"selected":"37D8832A-2D66-02CA-B9F7-8F30A301B230"}
+{"type":"setDisplay","id":"37D8832A-2D66-02CA-B9F7-8F30A301B230"}
+```
+
+**Dictation** needs no message of its own: the iPadOS keyboard's dictation key
+feeds the receiver's key-input view, which sends the recognized text as `text`
+messages (with `key` 36 for a line break).
+
 ## 7. Coordinate spaces and units
 
 The most common third-party bug is a unit mismatch, so here is every space

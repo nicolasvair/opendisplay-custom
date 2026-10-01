@@ -99,6 +99,10 @@ struct LocalControlBar: View {
                 Image(systemName: "hare").foregroundColor(.gray)
             }
             Spacer()
+            // Which Mac screen to mirror — only when there is a choice.
+            if receiver.senderMode == "mirror", receiver.macDisplays.count > 1 {
+                displayMenu
+            }
             // Only shown to a sender that announces its mode (this fork).
             if let current = receiver.senderMode {
                 Picker("", selection: Binding(get: { current },
@@ -123,6 +127,40 @@ struct LocalControlBar: View {
         .frame(height: LocalControls.barHeight)
         .background(Color.black)
         .environment(\.colorScheme, .dark)
+    }
+
+    private var displayMenu: some View {
+        let selected = receiver.macDisplays.first { $0.id == receiver.selectedMacDisplay }
+            ?? receiver.macDisplays.first { $0.main }
+            ?? receiver.macDisplays.first
+        return Menu {
+            ForEach(receiver.macDisplays, id: \.id) { display in
+                let title = "\(display.name) — \(display.w)×\(display.h)"
+                    + (display.main ? " (principal)" : "")
+                Button {
+                    receiver.selectedMacDisplay = display.id   // optimistic; the Mac confirms
+                    receiver.requestDisplay(display.id)
+                } label: {
+                    if display.id == selected?.id {
+                        Label(title, systemImage: "checkmark")
+                    } else {
+                        Text(title)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "display.2").font(.system(size: 18))
+                Text(selected?.name ?? "Écran")
+                    .font(.system(size: 16, weight: .medium))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 12)
+            .frame(maxWidth: 220, minHeight: 34)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.18)))
+            .contentShape(Rectangle())
+        }
+        .foregroundColor(.white)
     }
 
     private func barButton(systemImage: String? = nil, title: String? = nil, active: Bool,

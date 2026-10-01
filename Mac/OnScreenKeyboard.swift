@@ -254,12 +254,17 @@ final class KeyPoster {
             press(code: hit.code, flags: f)
             return
         }
-        let units = Array(text.utf16)
-        for down in [true, false] {
-            guard let e = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
-            e.flags = flags
-            e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
-            e.post(tap: .cghidEventTap)
+        // A keyboard event carries a limited number of UTF-16 units (~20), so
+        // longer text (dictation) goes out as one down/up pair per chunk.
+        let pieces = text.utf16.count > 16 ? TextChunking.chunks(text, maxUTF16: 16) : [text]
+        for piece in pieces {
+            let units = Array(piece.utf16)
+            for down in [true, false] {
+                guard let e = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
+                e.flags = flags
+                e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                e.post(tap: .cghidEventTap)
+            }
         }
     }
 

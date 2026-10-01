@@ -91,6 +91,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor var onCaptureStoppedByUser: (() -> Void)?
     /// A receiver's Extend/Mirror switch (custom local controls).
     @MainActor var onModeRequested: ((CaptureMode) -> Void)?
+    /// A receiver picked the Mac screen to mirror (custom `setDisplay`):
+    /// carries the CGDisplay UUID so the controller can remember it.
+    @MainActor var onMirrorDisplayChosen: ((String) -> Void)?
     // Fired when the device's display identity had to be abandoned (macOS
     // saved hostile state for it — see setupExtend) and a bumped identity
     // came online instead: carries the validated TOTAL offset from the
@@ -291,6 +294,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Only touched on `cursorQueue`.
     private var cursorSessionGeneration: UInt64 = 0
     private var captureDisplayID: CGDirectDisplayID = 0
+    // Mirror mode: the CGDisplay UUID of the screen the receiver chose (nil =
+    // main screen). Read from `queue` and from the async start/reconfigure
+    // tasks, so it sits behind a lock.
+    private let mirrorDisplayLock = NSLock()
+    private var _mirrorDisplayID: String?
+    var mirrorDisplayID: String? {
+        get { mirrorDisplayLock.lock(); defer { mirrorDisplayLock.unlock() }; return _mirrorDisplayID }
+        set { mirrorDisplayLock.lock(); _mirrorDisplayID = newValue; mirrorDisplayLock.unlock() }
+    }
+    private var screenParametersObserver: NSObjectProtocol?
+    // Last `displays` payload put on the wire (queue-confined): screen
+    // parameter notifications fire for every virtual display mode change, so
+    // an unchanged list is not re-sent unless forced (hello / new capture).
+    private var lastDisplaysJSON: String?
     // ScreenCaptureKit and VideoToolbox finish work asynchronously. During a
     // rotation, an old capture callback or a late encoder completion must not
     // put a frame from the retired display onto this device's new socket.
@@ -347,8 +364,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
-         identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
+         identityOffset: UInt32 = 0, awaitingWake: Bool = false,
+         preferredMirrorDisplayID: String? = nil) {
         self.transport = transport
+        self._mirrorDisplayID = preferredMirrorDisplayID
         self.endpointName = name
         self.mode = mode
         self.quality = quality
@@ -363,6 +382,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func start() async throws {
         stopped = false
         queue.async { self.connect() }   // dial state lives on `queue`
+        installScreenParametersObserver()
         if !monitorsStarted {
             monitorsStarted = true
             schedulePing()
@@ -389,10 +409,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // new fields and retain the existing H.264 behavior.
             let info = try await waitForHello()
             try await waitForScreensAwake()
-            let display = try await firstShareableDisplay()
+            let display = try await mirrorTargetDisplay()
             // Touch/scroll/Pencil land on the display being mirrored — the
             // same one the receiver's normalized coordinates describe.
-            inputInjector = InputInjector(displayID: display.displayID)
+            inputInjector = InputInjector(displayID: display.displayID, confined: true)
             Log.info("mirror: input injector on display \(display.displayID), "
                 + "accessibility trusted: \(AXIsProcessTrusted())")
             // SCDisplay.width/height are POINTS. Capturing at points on a
@@ -654,6 +674,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         reconfiguring = true
         defer { reconfiguring = false }
         var target = info
+        // A screen picked while this loop runs finds `reconfiguring` set and
+        // returns at the guard above; the check after the capture restarts
+        // here for it. Bounded so a display that flaps cannot spin forever.
+        var mirrorRetargetsLeft = 3
         while !stopped {
             Log.info("reconfiguring stream for \(target.pixelsWide)x\(target.pixelsHigh)")
             // A cached frame is valid for a network reconnect to the same
@@ -669,8 +693,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             do {
                 switch mode {
                 case .mirror:
-                    let display = try await firstShareableDisplay()
-                    inputInjector = InputInjector(displayID: display.displayID)
+                    let display = try await mirrorTargetDisplay()
+                    inputInjector = InputInjector(displayID: display.displayID, confined: true)
                     let displayMode = CGDisplayCopyDisplayMode(display.displayID)
                     try await startCapture(
                         display: display,
@@ -693,6 +717,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 Log.info("reconfigure failed: \(error)")
                 await status("Stream reconfiguration failed: \(error.localizedDescription)")
                 return
+            }
+            if mode == .mirror, mirrorRetargetsLeft > 0,
+               let wanted = resolvedMirrorDisplayID(), wanted != captureDisplayID {
+                mirrorRetargetsLeft -= 1
+                Log.info("mirror: chosen screen changed during the rebuild — restarting capture")
+                continue
             }
             if let latest = lastHello,
                streamSelectionInputsChanged(from: target, to: latest) {
@@ -950,12 +980,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // starts with as little as one round left.
         queue.async { self.captureRecoveryFailures = 0 }
         Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) generation \(generation) mode \(mode.rawValue) localCursor=\(localCursor)")
+        sendDisplayList(force: true)
         let kind = lastHello?.kind ?? "device"
         await status("\(mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
     }
 
     func stop() {
         stopped = true
+        if let observer = screenParametersObserver {
+            NotificationCenter.default.removeObserver(observer)
+            screenParametersObserver = nil
+        }
         // Only this session's bar: another device's session may own it.
         let barDisplayID = captureDisplayID
         Task { @MainActor in MirrorControlBar.hide(ifOn: barDisplayID) }
@@ -1183,17 +1218,127 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Log.info("Mac screen awake — resuming")
     }
 
-    /// The display to mirror. Right after a wake the shareable content can
-    /// briefly come back empty, so give it a few seconds before failing.
-    private func firstShareableDisplay() async throws -> SCDisplay {
+    /// The display to mirror: the receiver's chosen screen, else the main
+    /// screen, else the first one (see MirrorDisplaySelection). Right after a
+    /// wake the shareable content can briefly come back empty, so give it a
+    /// few seconds before failing. A chosen screen that is gone falls back
+    /// without touching the remembered choice — it may simply be unplugged.
+    private func mirrorTargetDisplay() async throws -> SCDisplay {
         for attempt in 0..<10 {
-            if let display = try await SCShareableContent.current.displays.first { return display }
+            let displays = try await SCShareableContent.current.displays
+            let candidates = Self.mirrorCandidates(ids: displays.map(\.displayID))
+            if let chosen = MirrorDisplaySelection.resolve(
+                    preferredID: mirrorDisplayID, available: candidates.map(\.info)),
+               let id = candidates.first(where: { $0.info.id == chosen.id })?.id,
+               let display = displays.first(where: { $0.displayID == id }) {
+                return display
+            }
+            // Only OpenDisplay virtual screens are shareable: keep the
+            // historical behaviour rather than failing.
+            if let display = displays.first { return display }
             if stopped { throw CancellationError() }
             if attempt == 0 { Log.info("no shareable display yet — retrying") }
             try await Task.sleep(for: .seconds(1))
         }
         throw NSError(domain: "MacSender", code: 1,
                       userInfo: [NSLocalizedDescriptionKey: "no displays found"])
+    }
+
+    // MARK: - Mirror screen selection (custom)
+
+    /// OpenDisplay's own virtual displays carry this vendor ID (VirtualDisplay).
+    private static let virtualDisplayVendorID: UInt32 = 0x5043
+
+    private static func displayUUIDString(_ id: CGDirectDisplayID) -> String? {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue(),
+              let string = CFUUIDCreateString(nil, uuid) else { return nil }
+        return string as String
+    }
+
+    /// Physical screens among `ids`, in order, as picker entries. Names default
+    /// to "Écran n"; pass `names` (from NSScreen, main actor) for real ones.
+    private static func mirrorCandidates(
+        ids: [CGDirectDisplayID],
+        names: [CGDirectDisplayID: String] = [:]
+    ) -> [(id: CGDirectDisplayID, info: MirrorDisplayInfo)] {
+        let mainID = CGMainDisplayID()
+        var result: [(id: CGDirectDisplayID, info: MirrorDisplayInfo)] = []
+        for id in ids where CGDisplayVendorNumber(id) != virtualDisplayVendorID {
+            guard let uuid = displayUUIDString(id) else { continue }
+            let mode = CGDisplayCopyDisplayMode(id)
+            let info = MirrorDisplayInfo(
+                id: uuid,
+                name: names[id] ?? "Écran \(result.count + 1)",
+                w: mode?.pixelWidth ?? Int(CGDisplayPixelsWide(id)),
+                h: mode?.pixelHeight ?? Int(CGDisplayPixelsHigh(id)),
+                main: id == mainID)
+            result.append((id, info))
+        }
+        return result
+    }
+
+    private static func activeDisplayIDs() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [] }
+        return Array(ids.prefix(Int(count)))
+    }
+
+    /// The Mac screens a receiver can pick from, with their names.
+    func currentMirrorDisplays() async -> [MirrorDisplayInfo] {
+        let names: [CGDirectDisplayID: String] = await MainActor.run {
+            var map: [CGDirectDisplayID: String] = [:]
+            for screen in NSScreen.screens {
+                if let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+                    map[id] = screen.localizedName
+                }
+            }
+            return map
+        }
+        return Self.mirrorCandidates(ids: Self.activeDisplayIDs(), names: names).map(\.info)
+    }
+
+    /// The display the current preference resolves to right now.
+    private func resolvedMirrorDisplayID() -> CGDirectDisplayID? {
+        let candidates = Self.mirrorCandidates(ids: Self.activeDisplayIDs())
+        guard let chosen = MirrorDisplaySelection.resolve(
+                preferredID: mirrorDisplayID, available: candidates.map(\.info)) else { return nil }
+        return candidates.first(where: { $0.info.id == chosen.id })?.id
+    }
+
+    private struct DisplaysMessage: Encodable {
+        let type = WireMessage.displays
+        let list: [MirrorDisplayInfo]
+        let selected: String?
+    }
+
+    /// Tell the receiver which screens exist and which one is mirrored. Sent in
+    /// both modes (the iPad only shows the picker in Mirror). Unknown to older
+    /// receivers, which ignore the type.
+    private func sendDisplayList(force: Bool = true) {
+        Task { [weak self] in
+            guard let self, !self.stopped else { return }
+            let list = await self.currentMirrorDisplays()
+            let selected = MirrorDisplaySelection.resolve(
+                preferredID: self.mirrorDisplayID, available: list)?.id
+            guard let data = try? JSONEncoder().encode(DisplaysMessage(list: list, selected: selected)),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            self.queue.async {
+                guard !self.stopped, force || json != self.lastDisplaysJSON else { return }
+                self.lastDisplaysJSON = json
+                self.sendJSONFrame(json)
+            }
+        }
+    }
+
+    private func installScreenParametersObserver() {
+        guard screenParametersObserver == nil else { return }
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: nil) { [weak self] _ in
+            self?.sendDisplayList(force: false)
+        }
     }
 
     /// On `queue`, every watchdog tick: while the receiver is live and the
@@ -2162,6 +2307,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 if let selected = activeStreamConfigurationSnapshot {
                     sendStreamConfiguration(selected)
                 }
+                sendDisplayList(force: true)
                 if info.protocolVersion < WireProtocol.minSupportedPeer {
                     Log.info("receiver protocol \(info.protocolVersion) below supported \(WireProtocol.minSupportedPeer) — requesting update")
                     sendUpdateRequired(kind: info.kind)
@@ -2226,6 +2372,21 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let raw = obj["mode"] as? String, let requested = CaptureMode(rawValue: raw),
                requested != mode {
                 Task { @MainActor in self.onModeRequested?(requested) }
+            }
+        case WireMessage.setDisplay:
+            // Custom: the receiver picked the Mac screen to mirror. Only
+            // meaningful while mirroring; extend captures its own virtual display.
+            if mode == .mirror, let id = obj["id"] as? String, id != mirrorDisplayID {
+                Log.info("receiver chose mirror screen \(id)")
+                mirrorDisplayID = id
+                Task { @MainActor in self.onMirrorDisplayChosen?(id) }
+                // Already capturing that screen (first pick equals the default):
+                // remember it, but do not tear the stream down for nothing.
+                let alreadyCaptured = captureDisplayID != 0
+                    && Self.displayUUIDString(captureDisplayID) == id
+                if !alreadyCaptured, let hello = lastHello {
+                    Task { await self.reconfigure(hello) }
+                }
             }
         case "key":
             if let code = obj["code"] as? Int, (0..<128).contains(code) {

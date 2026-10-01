@@ -59,8 +59,23 @@ final class InputInjector {
     private var penClickSession: PenClickSession?
     private var penLastClick: PenCompletedClick?
 
-    init(displayID: CGDirectDisplayID) {
+    /// Mirror mode: the cursor must stay on the mirrored display — on any
+    /// other one it would vanish from the receiver's picture and look frozen.
+    private let confined: Bool
+
+    init(displayID: CGDirectDisplayID, confined: Bool = false) {
         self.displayID = displayID
+        self.confined = confined
+        if confined { bringCursorOntoDisplay() }
+    }
+
+    /// A cursor left on another screen (e.g. after the mirrored screen was
+    /// switched) is moved to the middle of the mirrored one.
+    private func bringCursorOntoDisplay() {
+        let bounds = CGDisplayBounds(displayID)
+        guard !bounds.isEmpty, !bounds.contains(currentCursor()) else { return }
+        CGWarpMouseCursorPosition(CGPoint(x: bounds.midX, y: bounds.midY))
+        CGAssociateMouseAndMouseCursorPosition(1)
     }
 
     static func ensureAccessibilityPermission() -> Bool {
@@ -565,6 +580,11 @@ final class InputInjector {
     /// it may leave the streamed display for any other active one and only
     /// stops at the desktop's outer edges.
     private func desktopPoint(from old: CGPoint, to target: CGPoint, fallback: CGRect) -> CGPoint {
+        if confined {
+            let home = CGDisplayBounds(displayID)
+            return CGPoint(x: min(max(target.x, home.minX), home.maxX - 1),
+                           y: min(max(target.y, home.minY), home.maxY - 1))
+        }
         var count: UInt32 = 0
         CGGetActiveDisplayList(0, nil, &count)
         var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
