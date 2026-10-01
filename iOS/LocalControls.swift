@@ -80,6 +80,9 @@ struct LocalControlBar: View {
     @ObservedObject var controls = LocalControls.shared
     @ObservedObject var dictation = DictationController.shared
 
+    /// Every iPad is under 1100 pt wide in portrait and over it in landscape.
+    @State private var portrait = false
+
     var body: some View {
         HStack(spacing: 12) {
             // Left: keyboard and dictation.
@@ -120,12 +123,10 @@ struct LocalControlBar: View {
                     barButton(title: "Clic droit", active: controls.rightClickArmed) {
                         controls.rightClickArmed.toggle()
                     }
-                } else {
+                } else if !portrait {   // no room for the speed slider in portrait
                     Image(systemName: "tortoise").foregroundColor(.gray)
-                    // Shrinks first when the bar is tight (portrait).
                     Slider(value: $controls.trackpadSpeed, in: 0.4...2.5)
-                        .frame(minWidth: 40, maxWidth: 140)
-                        .layoutPriority(-1)
+                        .frame(width: 140)
                     Image(systemName: "hare").foregroundColor(.gray)
                 }
                 Picker("", selection: $controls.mode) {
@@ -141,6 +142,11 @@ struct LocalControlBar: View {
         .padding(.horizontal, 16)
         .frame(maxWidth: .infinity)
         .frame(height: LocalControls.barHeight)
+        .background(GeometryReader { geo in
+            Color.clear
+                .onAppear { portrait = geo.size.width < 1100 }
+                .onChange(of: geo.size.width) { portrait = $0 < 1100 }
+        })
         .background(Color.black)
         .environment(\.colorScheme, .dark)
     }
