@@ -194,6 +194,8 @@ targets:
         UIRequiresFullScreen: true
         NSLocalNetworkUsageDescription: OpenDisplay advertises itself on the local network so your Mac can connect over WiFi.
         NSBonjourServices: ["_opensidecar._tcp"]
+        NSMicrophoneUsageDescription: OpenDisplay utilise le micro pour la dictée vocale envoyée à votre Mac.
+        NSSpeechRecognitionUsageDescription: OpenDisplay transcrit votre voix en texte pour la saisir sur votre Mac.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

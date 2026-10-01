@@ -92,6 +92,8 @@ struct ReceiverScreen: View {
                         LocalControlBar(receiver: model.receiver)
                     }
                     .ignoresSafeArea()
+                    DictationOverlay()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -146,6 +148,7 @@ struct ReceiverScreen: View {
             switch phase {
             case .active: model.sceneDidActivate()
             case .background:
+                DictationController.shared.stop()
                 model.sceneDidBackground()
             default: break
             }
@@ -173,6 +176,7 @@ struct ReceiverScreen: View {
             model.appWillTerminate()
         }
         .onChange(of: model.receiver.connected) { isConnected in
+            if !isConnected { DictationController.shared.stop(commit: false) }
             // The first valid connection retires the onboarding hint for good.
             if isConnected {
                 hasConnectedBefore = true
