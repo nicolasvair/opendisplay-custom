@@ -27,9 +27,8 @@ final class LocalControls: ObservableObject {
     @Published var keyboardVisible = false
     /// While a docked keyboard is up, slide the picture up so it does not
     /// hide what is being worked on (trackpad mode follows the cursor).
-    @Published var followKeyboard = UserDefaults.standard.bool(forKey: "followKeyboard") {
-        didSet { UserDefaults.standard.set(followKeyboard, forKey: "followKeyboard") }
-    }
+    /// Always on: there is no toggle any more.
+    @Published var followKeyboard = true
     /// How far (points) the picture is currently slid up; the video view
     /// computes it, the screen applies it as an offset.
     @Published var keyboardShift: CGFloat = 0
@@ -83,49 +82,59 @@ struct LocalControlBar: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            barButton(systemImage: "keyboard", active: controls.keyboardVisible) {
-                controls.keyboardVisible.toggle()
-            }
-            barButton(systemImage: dictation.isListening ? "mic.fill" : "mic",
-                      active: dictation.isListening) {
-                dictation.toggle()
-            }
-            barButton(title: "Décaler", active: controls.followKeyboard) {
-                controls.followKeyboard.toggle()
-            }
-            if controls.mode == .touch {
-                barButton(title: "Clic droit", active: controls.rightClickArmed) {
-                    controls.rightClickArmed.toggle()
+            // Left: keyboard and dictation.
+            HStack(spacing: 12) {
+                barButton(systemImage: "keyboard", active: controls.keyboardVisible) {
+                    controls.keyboardVisible.toggle()
                 }
-            } else {
-                Image(systemName: "tortoise").foregroundColor(.gray)
-                Slider(value: $controls.trackpadSpeed, in: 0.4...2.5)
-                    .frame(width: 160)
-                Image(systemName: "hare").foregroundColor(.gray)
+                barButton(systemImage: dictation.isListening ? "mic.fill" : "mic",
+                          active: dictation.isListening) {
+                    dictation.toggle()
+                }
             }
-            Spacer()
-            // Which Mac screen to mirror — only when there is a choice.
-            if receiver.senderMode == "mirror", receiver.macDisplays.count > 1 {
-                displayMenu
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Centre: Extend / Mirror, and which Mac screen to mirror (only
+            // when there is a choice).
+            HStack(spacing: 12) {
+                // Only shown to a sender that announces its mode (this fork).
+                if let current = receiver.senderMode {
+                    Picker("", selection: Binding(get: { current },
+                                                  set: { receiver.requestMode($0) })) {
+                        Text("Étendre").tag("extend")
+                        Text("Recopie").tag("mirror")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 180)
+                    if current == "mirror", receiver.macDisplays.count > 1 {
+                        displayMenu
+                    }
+                }
             }
-            // Only shown to a sender that announces its mode (this fork).
-            if let current = receiver.senderMode {
-                Picker("", selection: Binding(get: { current },
-                                              set: { receiver.requestMode($0) })) {
-                    Text("Étendre").tag("extend")
-                    Text("Recopie").tag("mirror")
+
+            // Right: pointer-mode extras (speed or right click), then the
+            // Mouse / Touch switch.
+            HStack(spacing: 12) {
+                if controls.mode == .touch {
+                    barButton(title: "Clic droit", active: controls.rightClickArmed) {
+                        controls.rightClickArmed.toggle()
+                    }
+                } else {
+                    Image(systemName: "tortoise").foregroundColor(.gray)
+                    Slider(value: $controls.trackpadSpeed, in: 0.4...2.5)
+                        .frame(width: 140)
+                    Image(systemName: "hare").foregroundColor(.gray)
+                }
+                Picker("", selection: $controls.mode) {
+                    Label("Souris", systemImage: "rectangle.and.hand.point.up.left").tag(LocalPointerMode.trackpad)
+                    Label("Tactile", systemImage: "hand.point.up").tag(LocalPointerMode.touch)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 180)
+                .frame(width: 220)
             }
-            Picker("", selection: $controls.mode) {
-                Label("Tactile", systemImage: "hand.point.up").tag(LocalPointerMode.touch)
-                Label("Souris", systemImage: "rectangle.and.hand.point.up.left").tag(LocalPointerMode.trackpad)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 240)
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .frame(maxWidth: .infinity)
