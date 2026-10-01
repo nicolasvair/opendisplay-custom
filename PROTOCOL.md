@@ -602,7 +602,7 @@ back the same way without forgetting the choice.
 ```
 
 **Dictation** needs no message of its own: the iPadOS keyboard's dictation key
-is not used; the receiver transcribes locally (mic key above its keyboard)
+is not used; the receiver transcribes locally (mic button in its control bar)
 and sends the final text of each utterance as `text` messages (with `key` 36 for a line break).
 
 ## 7. Coordinate spaces and units

@@ -79,11 +79,16 @@ final class LocalControls: ObservableObject {
 struct LocalControlBar: View {
     @ObservedObject var receiver: StreamReceiver
     @ObservedObject var controls = LocalControls.shared
+    @ObservedObject var dictation = DictationController.shared
 
     var body: some View {
         HStack(spacing: 12) {
             barButton(systemImage: "keyboard", active: controls.keyboardVisible) {
                 controls.keyboardVisible.toggle()
+            }
+            barButton(systemImage: dictation.isListening ? "mic.fill" : "mic",
+                      active: dictation.isListening) {
+                dictation.toggle()
             }
             barButton(title: "Décaler", active: controls.followKeyboard) {
                 controls.followKeyboard.toggle()
@@ -235,7 +240,6 @@ final class MacKeyInputView: UIView, UIKeyInput {
 /// floating keyboard never covers it.
 struct MacKeysRow: View {
     @ObservedObject var controls = LocalControls.shared
-    @ObservedObject var dictation = DictationController.shared
 
     var body: some View {
         if controls.keyboardVisible {
@@ -251,7 +255,6 @@ struct MacKeysRow: View {
                     }
                 }
                 Divider().frame(height: 24).overlay(Color.white.opacity(0.3))
-                key(dictation.isListening ? "🎙︎●" : "🎙︎", active: dictation.isListening) { dictation.toggle() }
                 key("⌨︎↓", active: false) { controls.keyboardVisible = false }
             }
             .padding(.horizontal, 10)
