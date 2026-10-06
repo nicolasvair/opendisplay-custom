@@ -412,7 +412,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             let display = try await mirrorTargetDisplay()
             // Touch/scroll/Pencil land on the display being mirrored — the
             // same one the receiver's normalized coordinates describe.
-            inputInjector = InputInjector(displayID: display.displayID, confined: true)
+            inputInjector = InputInjector(displayID: display.displayID, mirrored: true)
             Log.info("mirror: input injector on display \(display.displayID), "
                 + "accessibility trusted: \(AXIsProcessTrusted())")
             // SCDisplay.width/height are POINTS. Capturing at points on a
@@ -694,7 +694,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 switch mode {
                 case .mirror:
                     let display = try await mirrorTargetDisplay()
-                    inputInjector = InputInjector(displayID: display.displayID, confined: true)
+                    inputInjector = InputInjector(displayID: display.displayID, mirrored: true)
                     let displayMode = CGDisplayCopyDisplayMode(display.displayID)
                     try await startCapture(
                         display: display,

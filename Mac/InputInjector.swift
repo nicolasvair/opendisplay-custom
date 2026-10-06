@@ -59,14 +59,17 @@ final class InputInjector {
     private var penClickSession: PenClickSession?
     private var penLastClick: PenCompletedClick?
 
-    /// Mirror mode: the cursor must stay on the mirrored display — on any
-    /// other one it would vanish from the receiver's picture and look frozen.
-    private let confined: Bool
+    /// Mirror mode: the cursor is free to leave the mirrored display, but it
+    /// is brought back onto it when a session starts and when the receiver
+    /// switches to trackpad mode — off it, it vanishes from the receiver's
+    /// picture and the trackpad looks frozen.
+    private let mirrored: Bool
+    private var lastMode = PointerModeState.shared.mode
 
-    init(displayID: CGDirectDisplayID, confined: Bool = false) {
+    init(displayID: CGDirectDisplayID, mirrored: Bool = false) {
         self.displayID = displayID
-        self.confined = confined
-        if confined { bringCursorOntoDisplay() }
+        self.mirrored = mirrored
+        if mirrored { bringCursorOntoDisplay() }
     }
 
     /// A cursor left on another screen (e.g. after the mirrored screen was
@@ -89,6 +92,9 @@ final class InputInjector {
 
     /// x/y are normalized [0,1] in video space (origin top-left).
     func handleTouch(phase: String, x: Double, y: Double, allowTrackpad: Bool = true) {
+        let mode = PointerModeState.shared.mode
+        if mirrored, mode == .trackpad, lastMode != .trackpad { bringCursorOntoDisplay() }
+        lastMode = mode
         let bounds = CGDisplayBounds(displayID)   // global CG coords, y-down
         let point = CGPoint(
             x: bounds.origin.x + x * bounds.width,
@@ -580,11 +586,6 @@ final class InputInjector {
     /// it may leave the streamed display for any other active one and only
     /// stops at the desktop's outer edges.
     private func desktopPoint(from old: CGPoint, to target: CGPoint, fallback: CGRect) -> CGPoint {
-        if confined {
-            let home = CGDisplayBounds(displayID)
-            return CGPoint(x: min(max(target.x, home.minX), home.maxX - 1),
-                           y: min(max(target.y, home.minY), home.maxY - 1))
-        }
         var count: UInt32 = 0
         CGGetActiveDisplayList(0, nil, &count)
         var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
