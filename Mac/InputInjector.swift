@@ -72,13 +72,20 @@ final class InputInjector {
         if mirrored { bringCursorOntoDisplay() }
     }
 
+    /// The receiver's own trackpad mode was just switched on.
+    func bringCursorBackIfMirrored() {
+        if mirrored { bringCursorOntoDisplay() }
+    }
+
     /// A cursor left on another screen (e.g. after the mirrored screen was
     /// switched) is moved to the middle of the mirrored one.
     private func bringCursorOntoDisplay() {
         let bounds = CGDisplayBounds(displayID)
         guard !bounds.isEmpty, !bounds.contains(currentCursor()) else { return }
-        CGWarpMouseCursorPosition(CGPoint(x: bounds.midX, y: bounds.midY))
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        CGWarpMouseCursorPosition(center)
         CGAssociateMouseAndMouseCursorPosition(1)
+        lastPointer = (center, CFAbsoluteTimeGetCurrent())
     }
 
     static func ensureAccessibilityPermission() -> Bool {

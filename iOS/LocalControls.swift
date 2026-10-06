@@ -20,7 +20,12 @@ final class LocalControls: ObservableObject {
 
     @Published var mode = LocalPointerMode(rawValue: UserDefaults.standard.string(forKey: "pointerMode") ?? "")
         ?? .touch {
-        didSet { UserDefaults.standard.set(mode.rawValue, forKey: "pointerMode") }
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: "pointerMode")
+            // The Mac brings a cursor left on another screen back onto the
+            // mirrored one, where this trackpad can see it.
+            if mode != oldValue { receiver?.sendPointerMode(mode.rawValue) }
+        }
     }
     /// Touch mode: the next tap becomes a right click, then it disarms.
     @Published var rightClickArmed = false

@@ -2357,6 +2357,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handlePointer(dx: dx, dy: dy)
             }
+        case "pointerMode":
+            if obj["mode"] as? String == "trackpad" {
+                inputInjector?.bringCursorBackIfMirrored()
+            }
         case "button":
             if let down = obj["down"] as? Bool {
                 inputInjector?.handleButton(right: (obj["button"] as? String) == "right", down: down,

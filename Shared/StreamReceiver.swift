@@ -1199,6 +1199,11 @@ final class StreamReceiver: ObservableObject {
         sendControl(["type": "pointer", "dx": dx, "dy": dy])
     }
 
+    /// The local pointer mode ("touch"/"trackpad") just changed.
+    func sendPointerMode(_ mode: String) {
+        sendControl(["type": "pointerMode", "mode": mode])
+    }
+
     /// Mouse button at the current cursor position.
     func sendButton(right: Bool, down: Bool, clicks: Int = 1, at point: (x: Double, y: Double)? = nil) {
         var msg: [String: Any] = ["type": "button", "button": right ? "right" : "left",
