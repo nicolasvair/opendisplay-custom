@@ -383,6 +383,10 @@ informational only. Note the asymmetry: the receiver's `ping` solicits a
 
 **`cursor`**: `v` is 1 (visible) or 0 (hidden). When visible, `x`, `y`
 give the normalized position (section 7); when hidden they MAY be absent.
+A custom sender also sends `a`, the `q` of the last `pointer` it applied
+(0 before any), and `pw`/`ph`, the streamed display's size in points. The
+position then already includes that move, so a receiver can draw the cursor
+at this position plus its pointer moves numbered above `a`.
 The cursor rides the control path rather than being baked into the video
 so it moves at input rate, not at video latency; the official sender emits
 up to 120 updates/s, deduplicated by movement threshold. Receivers without
@@ -572,7 +576,8 @@ Receiver to sender:
 | `type` | Fields | Purpose |
 |---|---|---|
 | `setMode` | `mode` (`"extend"` or `"mirror"`) | Switch the sender between extending and mirroring; the sender rebuilds its sessions |
-| `pointer` | `dx`, `dy` | Relative pointer move, in desktop points, acceleration already applied by the receiver |
+| `pointer` | `dx`, `dy`, `q`? | Relative pointer move, in desktop points, acceleration already applied by the receiver; `q` numbers it (increasing) so the receiver can predict the cursor (see `cursor.a`) |
+| `pointerMode` | `mode` (`"touch"`/`"trackpad"`) | The receiver's pointer mode changed; in mirror mode, switching to trackpad brings a cursor left on another screen back onto the mirrored one |
 | `button` | `button` (`"left"`/`"right"`), `down`, `clicks`?, `x`?, `y`? | Mouse button at the current cursor position (`x`, `y` optionally normalized, section 7); `clicks` defaults to 1 |
 | `text` | `s`, `mods`? | Text to type; `mods` bits: 1 command, 2 option, 4 control, 8 shift (default 0). The sender types any text that is not a single key of the current layout as Unicode, in pieces of at most 16 UTF-16 units per keyboard event |
 | `key` | `code`, `mods`? | A Mac virtual key code, 0..127 (Return is 36, Tab 48, Delete 51, arrows 123-126); same `mods` bits |

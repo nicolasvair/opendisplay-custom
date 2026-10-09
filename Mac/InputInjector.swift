@@ -316,8 +316,10 @@ final class InputInjector {
 
     /// A relative move computed by the receiver (acceleration included), in
     /// display points. Crosses onto other displays like a real mouse; drags
-    /// while a button the receiver pressed is held.
-    func handlePointer(dx: Double, dy: Double) {
+    /// while a button the receiver pressed is held. Returns where the cursor
+    /// was put.
+    @discardableResult
+    func handlePointer(dx: Double, dy: Double) -> CGPoint {
         let from = pointerPosition()
         let to = desktopPoint(from: from, to: CGPoint(x: from.x + dx, y: from.y + dy),
                               fallback: CGDisplayBounds(displayID))
@@ -326,11 +328,12 @@ final class InputInjector {
             : localRightDown ? .rightMouseDragged : .mouseMoved
         guard let event = CGEvent(mouseEventSource: source, mouseType: type,
                                   mouseCursorPosition: to,
-                                  mouseButton: localRightDown ? .right : .left) else { return }
+                                  mouseButton: localRightDown ? .right : .left) else { return to }
         // Apps that read raw deltas (games, some canvases) get them too.
         event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
         event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
         event.post(tap: .cghidEventTap)
+        return to
     }
 
     /// A button press or release at the cursor, or at normalized (nx, ny) on

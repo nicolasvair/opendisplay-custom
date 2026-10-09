@@ -264,7 +264,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // the session decides to redial (scheduleReconnect/switchTransport):
     // dial-phase failures take the grace/refusal rules, never this exit.
     private var currentPathDirectLink = false
-    private var lastCursorSent: (x: Double, y: Double, visible: Bool) = (-1, -1, false)
+    private var lastCursorSent: (x: Double, y: Double, visible: Bool, ack: UInt64) = (-1, -1, false, 0)
+    // Receiver-side cursor prediction: the receiver moves its cursor the
+    // moment the finger moves and numbers each `pointer` (`q`). Every cursor
+    // message carries the last applied number (`a`) so the receiver can
+    // replay only the moves the Mac has not applied yet. The position
+    // reported with an ack must already include that move, and a freshly
+    // posted event can still read back stale — so the injected point is
+    // reported for a short while instead of the read-back one.
+    private let pointerEchoLock = NSLock()
+    private var pointerEcho: (point: CGPoint, ack: UInt64, time: CFAbsoluteTime)?
+    private var cursorDisplayID: CGDirectDisplayID = 0   // cursorQueue only
     private var lastCursorPNGHash = 0
     // Cursor side channel (UDP, WiFi only): positions queue behind video
     // frames on the shared TCP socket and stutter under head-of-line
@@ -1483,9 +1493,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // not race the 120 Hz sampler. Publishing the matching generation in
         // the same block lets queued samples from the retired session be
         // rejected when they eventually reach the sender queue.
+        pointerEchoLock.withLock { pointerEcho = nil }
         cursorQueue.async {
             self.cursorSeq = 0
-            self.lastCursorSent = (-1, -1, false)
+            self.lastCursorSent = (-1, -1, false, 0)
             self.cursorSessionGeneration = readyGeneration
         }
         everConnected = true
@@ -1982,11 +1993,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorQueue.async { [weak self] in
             guard let self else { return }
             self.cursorTimer?.cancel()
-            self.lastCursorSent = (-1, -1, false)
+            self.lastCursorSent = (-1, -1, false, 0)
+            self.cursorDisplayID = displayID
             let timer = DispatchSource.makeTimerSource(queue: self.cursorQueue)
             timer.schedule(deadline: .now(), repeating: .milliseconds(8))   // 120Hz
             timer.setEventHandler { [weak self] in
-                self?.pollCursorPosition(displayID: displayID)
+                self?.pollCursorPosition()
             }
             timer.resume()
             self.cursorTimer = timer
@@ -1998,6 +2010,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorQueue.async { [weak self] in
             self?.cursorTimer?.cancel()
             self?.cursorTimer = nil
+            self?.cursorDisplayID = 0
         }
     }
 
@@ -2022,22 +2035,31 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorImageTimer = timer
     }
 
-    private func pollCursorPosition(displayID: CGDirectDisplayID) {
+    private func pollCursorPosition() {
+        let displayID = cursorDisplayID
         guard !stopped, displayID != 0,
-              let loc = CGEvent(source: nil)?.location else { return }
+              var loc = CGEvent(source: nil)?.location else { return }
+        let echo = pointerEchoLock.withLock { pointerEcho }
+        if let echo, CFAbsoluteTimeGetCurrent() - echo.time < 0.1 { loc = echo.point }
+        let ack = echo?.ack ?? 0
         let bounds = CGDisplayBounds(displayID)
         guard bounds.width > 0, bounds.height > 0 else { return }
+        // Display size in points: the receiver turns its pending moves
+        // (desktop points) into the normalized position it predicts.
+        let extra = String(format: ",\"a\":%llu,\"pw\":%.0f,\"ph\":%.0f",
+                           ack, bounds.width, bounds.height)
         if bounds.contains(loc) {
             let x = (loc.x - bounds.minX) / bounds.width
             let y = (loc.y - bounds.minY) / bounds.height
-            if !lastCursorSent.visible
+            if !lastCursorSent.visible || ack != lastCursorSent.ack
                 || abs(x - lastCursorSent.x) > 0.0004 || abs(y - lastCursorSent.y) > 0.0004 {
-                lastCursorSent = (x, y, true)
-                sendCursor(String(format: "\"x\":%.4f,\"y\":%.4f,\"v\":1", x, y))
+                lastCursorSent = (x, y, true, ack)
+                sendCursor(String(format: "\"x\":%.4f,\"y\":%.4f,\"v\":1", x, y) + extra)
             }
-        } else if lastCursorSent.visible {
+        } else if lastCursorSent.visible || ack != lastCursorSent.ack {
             lastCursorSent.visible = false
-            sendCursor("\"v\":0")
+            lastCursorSent.ack = ack
+            sendCursor("\"v\":0" + extra)
         }
     }
 
@@ -2354,8 +2376,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         // Custom local-controls messages (receiver-side trackpad + keyboard).
         case "pointer":
-            if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
-                inputInjector?.handlePointer(dx: dx, dy: dy)
+            if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double,
+               let point = inputInjector?.handlePointer(dx: dx, dy: dy) {
+                if let q = (obj["q"] as? NSNumber)?.uint64Value {
+                    pointerEchoLock.withLock { pointerEcho = (point, q, CFAbsoluteTimeGetCurrent()) }
+                }
+                // Report the move now rather than at the next 8 ms sample.
+                cursorQueue.async { [weak self] in self?.pollCursorPosition() }
             }
         case "pointerMode":
             if obj["mode"] as? String == "trackpad" {

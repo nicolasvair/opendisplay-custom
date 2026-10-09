@@ -818,6 +818,7 @@ final class StreamReceiver: ObservableObject {
         // it would ghost over a new sender that never sends one (mirror mode
         // hides no local cursor and streams no sprite).
         DispatchQueue.main.async {
+            self.resetCursorPrediction()
             self.cursorState = (0.5, 0.5, false)
             self.cursorSprite = nil
             self.onCursor?(0.5, 0.5, false)
@@ -1012,11 +1013,57 @@ final class StreamReceiver: ObservableObject {
         let visible = (obj["v"] as? Int ?? 0) == 1
         let x = obj["x"] as? Double ?? 0
         let y = obj["y"] as? Double ?? 0
+        let ack = (obj["a"] as? NSNumber)?.uint64Value
+        let pw = obj["pw"] as? Double ?? 0
+        let ph = obj["ph"] as? Double ?? 0
         cursorUpdatesThisWindow += 1
         DispatchQueue.main.async {
             self.cursorState = (x, y, visible)
-            self.onCursor?(x, y, visible)
+            if let ack {
+                self.pointerAckSupported = true
+                self.pendingPointer.removeAll { $0.seq <= ack }
+                if pw > 0, ph > 0 { self.macDisplayPoints = CGSize(width: pw, height: ph) }
+            }
+            if !self.showPredictedCursor() { self.onCursor?(x, y, visible) }
         }
+    }
+
+    // MARK: - Cursor prediction (local trackpad)
+    //
+    // The cursor drawn here used to move only when the Mac reported its new
+    // position: a full WiFi round trip, so every WiFi hiccup froze it. Now
+    // each move is shown at once — the Mac's last position plus the moves it
+    // has not acknowledged yet — and the Mac's reports keep correcting it
+    // (edges, other screens, acceleration rounding). Main thread only.
+
+    private var pointerSeq: UInt64 = 0   // never rewound: the Mac resets its ack per session
+    private var pendingPointer: [(seq: UInt64, dx: Double, dy: Double, time: CFTimeInterval)] = []
+    private var pointerAckSupported = false   // the Mac acks moves (older ones do not)
+    private var macDisplayPoints: CGSize?
+
+    private func resetCursorPrediction() {
+        pendingPointer.removeAll()
+        pointerAckSupported = false
+        macDisplayPoints = nil
+    }
+
+    /// Shows the predicted cursor; false when there is nothing to predict.
+    @discardableResult
+    private func showPredictedCursor() -> Bool {
+        // A move the Mac never acknowledges (dropped, no injector) must not
+        // leave the cursor drifting.
+        let now = CACurrentMediaTime()
+        pendingPointer.removeAll { now - $0.time > 1 }
+        guard pointerAckSupported, !pendingPointer.isEmpty, cursorState.visible,
+              let size = macDisplayPoints else { return false }
+        let dx = pendingPointer.reduce(0) { $0 + $1.dx }
+        let dy = pendingPointer.reduce(0) { $0 + $1.dy }
+        // Held at the edge: whether it leaves for another screen or stops
+        // there is the Mac's call, and its next report says which.
+        let x = min(max(cursorState.x + dx / size.width, 0), 0.9999)
+        let y = min(max(cursorState.y + dy / size.height, 0), 0.9999)
+        onCursor?(x, y, true)
+        return true
     }
 
     private func resetStreamState() {
@@ -1196,7 +1243,11 @@ final class StreamReceiver: ObservableObject {
 
     /// Relative pointer move in desktop points, acceleration already applied.
     func sendPointer(dx: Double, dy: Double) {
-        sendControl(["type": "pointer", "dx": dx, "dy": dy])
+        pointerSeq &+= 1
+        sendControl(["type": "pointer", "dx": dx, "dy": dy, "q": pointerSeq])
+        guard pointerAckSupported else { return }
+        pendingPointer.append((pointerSeq, dx, dy, CACurrentMediaTime()))
+        showPredictedCursor()
     }
 
     /// The local pointer mode ("touch"/"trackpad") just changed.
