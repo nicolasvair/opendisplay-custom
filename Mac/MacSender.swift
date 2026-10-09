@@ -218,6 +218,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // ambiguous failure kinds.
     private var consecutiveRefusals = 0
     private let refusalsBeforeGivingUp = 3
+    // Set from switchTransport until the new transport connects. Only
+    // touched on `queue`.
+    private var switchingTransport = false
     private var dropsTotal: Int { dropsEncTotal + dropsNetTotal }
 
     // Local cursor echo: a cursor baked into the video carries the full
@@ -1043,10 +1046,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async { [weak self] in self?.pairingSecret = secret }
     }
 
-    func switchTransport(to newTransport: SenderTransport, pairingSecret secret: Data? = nil) {
+    /// `completion` reports the outcome of a live cable-in upgrade (see
+    /// upgradeLive); the break-before-make path below never calls it.
+    func switchTransport(to newTransport: SenderTransport, pairingSecret secret: Data? = nil,
+                         completion: (@MainActor (Bool) -> Void)? = nil) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
+            // A working link is only given up for a cable that answered.
+            if case .usb(let udid, let port) = newTransport, self.connectionReady,
+               let live = self.connection {
+                self.upgradeLive(live, toUSB: udid, port: port, completion: completion)
+                return
+            }
             self.pairingSecret = secret
+            // The refusal rule reads "the app that just streamed is gone" —
+            // a transport that never carried this session proves nothing.
+            self.consecutiveRefusals = 0
+            self.switchingTransport = true
             let label = if case .usb = newTransport { "USB" } else { "WiFi" }
             Log.info("switching \(self.endpointName) to \(label)")
             self.transport = newTransport
@@ -1066,6 +1082,48 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.pendingEncodes = 0
             self.pipelineLock.unlock()
             self.connect()
+        }
+    }
+
+    /// Cable plugged in under a streaming session (must be called on
+    /// `queue`): dial USB next to the live connection and swap only once it
+    /// answers. Cutting WiFi first ended the whole session whenever the
+    /// device's USB listener refused — and the controller then rebuilt the
+    /// WiFi session and migrated it again, in a loop. A failed dial leaves
+    /// the session exactly as it was; the controller decides when to retry.
+    private func upgradeLive(_ live: NWConnection, toUSB udid: String?, port: UInt16,
+                             completion: (@MainActor (Bool) -> Void)?) {
+        let generation = dialGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            let result: Result<NWConnection, Error>
+            do {
+                result = .success(try await Usbmux.dial(udid: udid, port: port, queue: queue))
+            } catch {
+                result = .failure(error)
+            }
+            queue.async {
+                switch result {
+                case .failure(let error):
+                    Log.info("usb upgrade dial failed: \(error) — \(self.endpointName) stays on WiFi")
+                    Task { @MainActor in completion?(false) }
+                case .success(let conn):
+                    // The session moved on while the dial was in flight
+                    // (reconnect, another switch, stop): not ours to adopt.
+                    guard generation == self.dialGeneration, !self.stopped,
+                          self.connection === live, self.connectionReady else {
+                        conn.cancel()
+                        Task { @MainActor in completion?(false) }
+                        return
+                    }
+                    Log.info("switching \(self.endpointName) to USB")
+                    self.transport = .usb(udid: udid, port: port)
+                    self.pairingSecret = nil
+                    self.currentPathDirectLink = false   // the new transport re-classifies
+                    self.adoptLive(conn)
+                    Task { @MainActor in completion?(true) }
+                }
+            }
         }
     }
 
@@ -1138,7 +1196,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// that has streamed before, enough refusals in a row prove the receiver
     /// app is gone — end now instead of waiting out the grace.
     private func dialRefused() {
-        guard everConnected, !stopped else { return }
+        // Mid-switch the grace window decides instead (see switchTransport).
+        guard everConnected, !stopped, !switchingTransport else { return }
         consecutiveRefusals += 1
         if consecutiveRefusals >= refusalsBeforeGivingUp {
             reportGone("dial refused \(consecutiveRefusals)x — receiver app is gone, ending session")
@@ -1502,6 +1561,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         everConnected = true
         awaitingWake = false
         consecutiveRefusals = 0
+        switchingTransport = false
         disconnectedSince = nil
         needsKeyframe = true   // new peer needs SPS/PPS + IDR
         resetFrameRateLimiterForReconnect()
@@ -1685,6 +1745,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Log.info("cable path answered (\(names)) — migrating the session off WiFi")
         upgradeProbes.removeAll { $0 === conn }
         stopUpgradeProbing()
+        adoptLive(conn)
+    }
+
+    /// Replace the live connection with an already-established one (must be
+    /// called on `queue`) — the make-before-break half of a migration.
+    private func adoptLive(_ conn: NWConnection) {
         dialGeneration += 1   // a redial in flight must not clobber this
         closeCursorChannel()  // rebuilt from the next hello on the new path
         // Close the video gate before publishing the new socket. Encoded

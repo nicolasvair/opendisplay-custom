@@ -252,12 +252,17 @@ final class SenderController: ObservableObject {
     // app reopened after the iPad slept.
     private var wifiAutoConnectArmed = false
 
+    // Cable-in upgrades that failed while WiFi kept streaming, per udid:
+    // the next attempt waits out a growing delay. Replugging starts over.
+    private var usbUpgradeBackoff: [String: (failures: Int, until: Date)] = [:]
+
     init() {
         startBrowsing()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             guard let self else { return }
             let detached = Set(self.usbDevices.map(\.udid)).subtracting(devices.map(\.udid))
             self.usbDevices = devices
+            for udid in detached { self.usbUpgradeBackoff[udid] = nil }
             self.failover(detachedUDIDs: detached)
             self.autoConnect()
         }
@@ -456,13 +461,34 @@ final class SenderController: ObservableObject {
     /// session onto USB. No-op when the session is already cabled.
     private func upgradeToUSB(_ session: DeviceSession, device: UsbmuxDevice) {
         guard !session.onUSB, let portNum = UInt16(port) else { return }
+        if let backoff = usbUpgradeBackoff[device.udid], Date() < backoff.until { return }
         Log.info("cable attached for \(session.id) — migrating to USB")
         session.onUSB = true
         session.usbUDID = device.udid
         // The match may have been by name only — pin the strong identity so
         // future matching (and the next launch) recognizes the pair.
         if let id = session.deviceID { installIDByUDID[device.udid] = id }
-        session.sender.switchTransport(to: .usb(udid: device.udid, port: portNum))
+        let udid = device.udid
+        session.sender.switchTransport(to: .usb(udid: udid, port: portNum)) { [weak self, weak session] succeeded in
+            guard let self else { return }
+            guard !succeeded else {
+                self.usbUpgradeBackoff[udid] = nil
+                return
+            }
+            // Still streaming over WiFi. Every hello and browse event re-runs
+            // auto-connect, so without a memory of the failure the dial
+            // would be retried on the spot, forever.
+            session?.onUSB = false
+            session?.usbUDID = nil
+            let failures = (self.usbUpgradeBackoff[udid]?.failures ?? 0) + 1
+            let delay = min(5 * pow(2, Double(failures - 1)), 60)
+            self.usbUpgradeBackoff[udid] = (failures, Date().addingTimeInterval(delay))
+            Log.info("USB upgrade failed for \(udid) (\(failures)x) — staying on WiFi, retrying in \(Int(delay))s")
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(delay + 0.1))
+                self.autoConnect()
+            }
+        }
     }
 
     /// Cable unplugged under a live session: fail over to the device's WiFi
