@@ -127,7 +127,9 @@ final class SecureEnclaveIdentity: RemoteIdentity {
         let signing: SecureEnclave.P256.Signing.PrivateKey
         // A handle copied from another machine (migration, backup) may load
         // but cannot sign; probe it and start over with a fresh key if so.
-        if let blob = KeychainBlob.load(service: keychainService, account: "signing"),
+        // A failed read throws (fail closed) rather than passing for "no key
+        // yet", which would replace this device's identity.
+        if let blob = try KeychainBlob.load(service: keychainService, account: "signing"),
            let key = try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: blob),
            (try? key.signature(for: Data("probe".utf8))) != nil {
             signing = key
@@ -136,7 +138,7 @@ final class SecureEnclaveIdentity: RemoteIdentity {
             try KeychainBlob.save(signing.dataRepresentation, service: keychainService, account: "signing")
         }
         let agreement: SecureEnclave.P256.KeyAgreement.PrivateKey
-        if let blob = KeychainBlob.load(service: keychainService, account: "agreement"),
+        if let blob = try KeychainBlob.load(service: keychainService, account: "agreement"),
            let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob),
            (try? key.sharedSecretFromKeyAgreement(with: P256.KeyAgreement.PrivateKey().publicKey)) != nil {
             agreement = key
@@ -616,9 +618,11 @@ extension RemoteHost: RemoteRecord {}
 enum RemoteStore {
     private static let service = "OpenDisplay Custom remote pairing"
 
-    static func peers() -> [RemotePeer] { load(account: "mac") }
+    // Reads throw on Keychain errors: callers must not mistake a failed read
+    // for an empty list and then save over every existing pairing.
+    static func peers() throws -> [RemotePeer] { try load(account: "mac") }
     static func savePeers(_ peers: [RemotePeer]) throws { try save(peers, account: "mac") }
-    static func hosts() -> [RemoteHost] { load(account: "device") }
+    static func hosts() throws -> [RemoteHost] { try load(account: "device") }
     static func saveHosts(_ hosts: [RemoteHost]) throws { try save(hosts, account: "device") }
 
     /// Adds or replaces `record`. It replaces any entry with the same
@@ -627,10 +631,9 @@ enum RemoteStore {
         records.filter { $0.id != record.id && $0.pskIdentity != record.pskIdentity } + [record]
     }
 
-    private static func load<T: Codable>(account: String) -> [T] {
-        guard let data = KeychainBlob.load(service: service, account: account),
-              let records = try? JSONDecoder().decode([T].self, from: data) else { return [] }
-        return records
+    private static func load<T: Codable>(account: String) throws -> [T] {
+        guard let data = try KeychainBlob.load(service: service, account: account) else { return [] }
+        return try JSONDecoder().decode([T].self, from: data)
     }
 
     private static func save<T: Codable>(_ records: [T], account: String) throws {
@@ -646,12 +649,15 @@ enum RemoteStore {
 
 /// Generic-password items, this device only.
 enum KeychainBlob {
-    static func load(service: String, account: String) -> Data? {
+    /// nil only when there is no such item; any other failure throws.
+    static func load(service: String, account: String) throws -> Data? {
         var query = baseQuery(service, account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return nil }
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw RemoteTrustError.keychain(status) }
         return item as? Data
     }
 
