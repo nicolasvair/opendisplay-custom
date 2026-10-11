@@ -162,6 +162,7 @@ targets:
       - Shared/Protocol.swift
       - Shared/TextChunking.swift
       - Shared/LogSnapshot.swift
+      - Shared/RemoteTrust.swift
       - MacReceiver/FullscreenPreference.swift
     settings:
       base:
