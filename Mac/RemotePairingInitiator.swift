@@ -29,20 +29,34 @@ final class RemotePairingInitiator: ObservableObject {
     /// user accepts, so it reflects the current network.
     var endpoint: (() -> (addresses: [String], port: UInt16))?
 
+    /// The receiver's pairing listener always sits at this base port plus
+    /// RemoteWire.usbPairingPortOffset, whatever port this Mac streams to.
+    static let devicePairingBasePort: UInt16 = 9000
+
+    /// Where the dialogue stands (PROTOCOL.md 2.4.3). Every message is
+    /// accepted in exactly one step; anything else ends the attempt.
+    private enum Step {
+        case idle
+        case dialing
+        case committed        // rpCommit sent, waiting for the device's rpHello
+        case comparing        // own rpHello sent, codes on screen
+        case confirmed        // own rpConfirm sent, waiting for the device's
+    }
+
     private let queue = DispatchQueue(label: "remote.pairing")
     private var channel: PairingChannel?
     // Bumped by every new attempt and every failure: callbacks of an older
     // attempt (late dial, timeout) find a different number and stand down.
     private var attempt = 0
+    private var step: Step = .idle
     private var identity: SecureEnclaveIdentity?
     private var ephemeral: Curve25519.KeyAgreement.PrivateKey?
+    // Built (fresh ephemeral, fresh PSK identity) before the commit is sent
+    // and never changed afterwards: the device checks it against the commit.
     private var macHello: RemotePairing.Hello?
     private var deviceHello: RemotePairing.Hello?
     private var transcript: Data?
     private var secret: Data?
-    // The peer is stored only when both hold (PROTOCOL.md 2.4.3).
-    private var localAccepted = false
-    private var deviceConfirmed = false
 
     private var inProgress: Bool {
         switch state {
@@ -56,7 +70,7 @@ final class RemotePairingInitiator: ObservableObject {
         RemotePairing.normalizedName(Host.current().localizedName ?? "", role: .mac)
     }
 
-    func pair(udid: String, name: String, basePort: UInt16) {
+    func pair(udid: String, name: String) {
         if inProgress { fail("Remplacé par une nouvelle tentative") }
         clearExchange()
         attempt += 1
@@ -67,13 +81,10 @@ final class RemotePairingInitiator: ObservableObject {
                             + "l'accès à distance est indisponible.")
             return
         }
-        guard basePort <= UInt16.max - RemoteWire.usbPairingPortOffset else {
-            state = .failed("Port de base invalide")
-            return
-        }
         self.identity = identity
+        step = .dialing
         state = .connecting(name)
-        let port = basePort + RemoteWire.usbPairingPortOffset
+        let port = Self.devicePairingBasePort + RemoteWire.usbPairingPortOffset
         Log.info("remote pairing: dialing \(udid) port \(port) over USB")
         let queue = self.queue
         Task { [weak self] in
@@ -105,9 +116,12 @@ final class RemotePairingInitiator: ObservableObject {
         }
     }
 
-    /// The user checked that both screens show the same code.
+    /// The user checked that both screens show the same code. The Mac's
+    /// confirm leaves now; the device answers with its own once it has
+    /// verified ours and its user accepted too.
     func accept() {
-        guard case .compare(_, let device) = state, let identity, let transcript else { return }
+        guard step == .comparing, case .compare(_, let device) = state,
+              let identity, let transcript else { return }
         let info: (addresses: [String], port: UInt16) =
             endpoint?() ?? (addresses: [], port: RemoteWire.defaultMacPort)
         let confirm: [String: Any]
@@ -119,13 +133,9 @@ final class RemotePairingInitiator: ObservableObject {
             return fail("Signature impossible : \(error.localizedDescription)")
         }
         send(confirm)
-        localAccepted = true
+        step = .confirmed
+        state = .waitingDevice(device)
         Log.info("remote pairing: accepted on the Mac (\(info.addresses.count) address(es), port \(info.port))")
-        if deviceConfirmed {
-            complete()
-        } else {
-            state = .waitingDevice(device)
-        }
     }
 
     /// The codes differ: someone else may be in the exchange.
@@ -148,7 +158,7 @@ final class RemotePairingInitiator: ObservableObject {
     // MARK: Private
 
     private func connected(_ conn: NWConnection, attempt current: Int, name: String) {
-        guard attempt == current, case .connecting = state, let identity else {
+        guard attempt == current, step == .dialing, case .connecting = state, let identity else {
             conn.cancel()
             return
         }
@@ -165,20 +175,23 @@ final class RemotePairingInitiator: ObservableObject {
             }
         }
         self.channel = channel
+        // The whole hello (fresh ephemeral key, fresh PSK identity) is fixed
+        // here, before the commit leaves, and never changes afterwards.
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         let hello = RemotePairing.Hello(name: Self.macName, signingKey: identity.publicKey,
                                         ephemeralKey: ephemeral.publicKey.rawRepresentation,
                                         pskIdentity: RemotePairing.newPSKIdentity(), installID: nil)
         self.ephemeral = ephemeral
         macHello = hello
-        let message = RemotePairing.helloMessage(hello)
+        step = .committed
+        let commit = RemotePairing.commitMessage(hello)
         // Usbmux hands the connection over already started on `queue`;
         // start() only installs the handlers and begins reading.
         queue.async {
             channel.start()
-            channel.send(message)
+            channel.send(commit)
         }
-        Log.info("remote pairing: connected to \(name) over USB")
+        Log.info("remote pairing: connected to \(name) over USB — commitment sent")
     }
 
     private func handle(_ msg: [String: Any], attempt current: Int) {
@@ -187,51 +200,62 @@ final class RemotePairingInitiator: ObservableObject {
         if type == RemoteWire.pairAbort {
             return fail("Appairage annulé sur l'appareil.", notifyDevice: false)
         }
-        if type == RemoteWire.pairHello, case .connecting = state {
-            guard let macHello, let ephemeral,
-                  let device = RemotePairing.parseHello(msg, from: .device) else {
-                return fail("Réponse de l'appareil invalide")
-            }
-            guard device.signingKey != macHello.signingKey else {
-                return fail("L'appareil présente la clé de ce Mac")
-            }
-            let transcript = RemotePairing.transcript(mac: macHello, device: device)
-            do {
-                secret = try RemotePairing.secret(ownEphemeral: ephemeral,
-                                                  peerEphemeral: device.ephemeralKey,
-                                                  transcript: transcript)
-            } catch {
-                return fail("Échange de clés impossible")
-            }
-            self.ephemeral = nil   // used once, never kept
-            deviceHello = device
-            self.transcript = transcript
-            state = .compare(code: RemotePairing.code(transcript: transcript), device: device.name)
-            return
+        if type == RemoteWire.pairHello, step == .committed {
+            receiveDeviceHello(msg)
+        } else if type == RemoteWire.pairConfirm, step == .confirmed {
+            receiveDeviceConfirm(msg)
+        } else {
+            // Out of order, repeated or unknown: the dialogue has exactly
+            // one valid shape.
+            fail("Message d'appairage inattendu (\(type ?? "sans type"))")
         }
-        if type == RemoteWire.pairConfirm, !deviceConfirmed, let device = deviceHello, let transcript {
-            switch state {
-            case .compare, .waitingDevice: break
-            default: return fail("Message d'appairage inattendu")
-            }
-            guard RemotePairing.verifyConfirm(msg, from: .device, transcript: transcript,
-                                              peerKey: device.signingKey) else {
-                return fail("La confirmation de l'appareil ne correspond pas — rien n'a été enregistré.")
-            }
-            // The official device answers only after our confirm, but the
-            // protocol lets confirms cross: accept either order.
-            deviceConfirmed = true
-            Log.info("remote pairing: \(device.name) confirmed")
-            if localAccepted { complete() }
-            return
-        }
-        fail("Message d'appairage inattendu")
     }
 
-    /// Both conditions hold: store the peer.
+    /// The device spoke after our commitment: only now does the Mac reveal
+    /// its hello, unchanged.
+    private func receiveDeviceHello(_ msg: [String: Any]) {
+        guard let macHello, let ephemeral,
+              let device = RemotePairing.parseHello(msg, from: .device) else {
+            return fail("Réponse de l'appareil invalide")
+        }
+        guard device.signingKey != macHello.signingKey else {
+            return fail("L'appareil présente la clé de ce Mac")
+        }
+        let transcript = RemotePairing.transcript(mac: macHello, device: device)
+        do {
+            secret = try RemotePairing.secret(ownEphemeral: ephemeral,
+                                              peerEphemeral: device.ephemeralKey,
+                                              transcript: transcript)
+        } catch {
+            return fail("Échange de clés impossible")
+        }
+        self.ephemeral = nil   // used once, never kept
+        deviceHello = device
+        self.transcript = transcript
+        send(RemotePairing.helloMessage(macHello))
+        step = .comparing
+        state = .compare(code: RemotePairing.code(transcript: transcript), device: device.name)
+    }
+
+    /// The device verified our confirm and its user accepted.
+    private func receiveDeviceConfirm(_ msg: [String: Any]) {
+        guard let device = deviceHello, let transcript else {
+            return fail("Message d'appairage inattendu")
+        }
+        guard RemotePairing.verifyConfirm(msg, from: .device, transcript: transcript,
+                                          peerKey: device.signingKey) else {
+            return fail("La confirmation de l'appareil ne correspond pas — rien n'a été enregistré.")
+        }
+        Log.info("remote pairing: \(device.name) confirmed")
+        complete()
+    }
+
+    /// Our user accepted and the device's confirm checked out: store the peer.
     private func complete() {
-        guard localAccepted, deviceConfirmed, let identity, let device = deviceHello,
-              let pid = macHello?.pskIdentity, let secret else { return }
+        guard step == .confirmed, let identity, let device = deviceHello,
+              let pid = macHello?.pskIdentity, let secret else {
+            return fail("Appairage incomplet")
+        }
         let peer: RemotePeer
         do {
             let sealed = try identity.seal(secret)
@@ -242,7 +266,19 @@ final class RemotePairingInitiator: ObservableObject {
                               pskIdentity: pid,
                               sealedSecret: sealed,
                               pairedAt: Date())
-            try RemoteStore.savePeers(RemoteStore.merged(RemoteStore.peers(), with: peer))
+        } catch {
+            return fail("Impossible de protéger la clé de l'appairage : \(error)")
+        }
+        // A failed read must not pass for "no pairing yet": saving the merge
+        // over it would erase every other paired device.
+        let existing: [RemotePeer]
+        do {
+            existing = try RemoteStore.peers()
+        } catch {
+            return fail("Lecture du trousseau impossible (\(error)) — rien n'a été enregistré.")
+        }
+        do {
+            try RemoteStore.savePeers(RemoteStore.merged(existing, with: peer))
         } catch {
             return fail("Impossible d'enregistrer l'appairage : \(error)")
         }
@@ -251,7 +287,7 @@ final class RemotePairingInitiator: ObservableObject {
         self.channel = nil
         clearExchange()
         state = .paired(peer.name)
-        // Let our confirm leave before the connection closes.
+        // Let our last bytes leave before the connection closes.
         queue.asyncAfter(deadline: .now() + 0.5) { channel?.close("paired") }
         onPaired?()
     }
@@ -278,14 +314,13 @@ final class RemotePairingInitiator: ObservableObject {
     }
 
     private func clearExchange() {
+        step = .idle
         identity = nil
         ephemeral = nil
         macHello = nil
         deviceHello = nil
         transcript = nil
         secret = nil
-        localAccepted = false
-        deviceConfirmed = false
     }
 }
 
@@ -340,8 +375,7 @@ struct RemotePairingSheet: View {
                     Text(device.name ?? "iPhone / iPad")
                     Spacer()
                     Button("Appairer") {
-                        pairing.pair(udid: device.udid, name: device.name ?? "iPhone / iPad",
-                                     basePort: UInt16(controller.port) ?? 9000)
+                        pairing.pair(udid: device.udid, name: device.name ?? "iPhone / iPad")
                     }
                     .disabled(!SecureEnclave.isAvailable)
                 }

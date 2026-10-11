@@ -20,8 +20,12 @@ import Darwin
 //   within RemoteWire.authTimeout, and must carry a signature over this TLS
 //   session's exporter by the peer's pinned Secure Enclave key. Only then
 //   does the connection reach a MacSender (hello, input, video).
-// * At most `maxPending` unauthenticated connections at once, and a source
+// * At most `maxPending` unauthenticated connections at once (the oldest is
+//   dropped to make room), a few per source address or prefix, and a source
 //   that keeps failing is refused for a while.
+// * A device the Mac would turn away anyway (disconnected by the user, or
+//   connected locally) gets no signed answer: the refusal is decided before
+//   the Mac signs anything for it.
 
 /// Remote access settings, persisted in UserDefaults. Not actor-bound, so
 /// stored property defaults and the listener can read them.
@@ -219,13 +223,31 @@ final class RemoteListener {
     private var listener: NWListener?
     private var generation = 0
     private var peers: [RemotePeer] = []
+    // Peers (by id) the controller would turn away right now, and whether it
+    // turns away everyone (feature off). Set through `setRefusals`.
+    private var refused: Set<String> = []
+    private var refuseAll = true
+
+    private struct Pending {
+        let connection: NWConnection
+        let source: String        // IPv4 address or IPv6 /64
+        let wideSource: String?   // IPv6 /48, nil for IPv4
+        let acceptedAt: TimeInterval
+    }
     // Connections accepted but not (yet) authenticated.
-    private var pending: [ObjectIdentifier: NWConnection] = [:]
+    private var pending: [ObjectIdentifier: Pending] = [:]
     // Failed attempts per source (IPv4 address or IPv6 /64), uptime clock.
     private var failures: [String: [TimeInterval]] = [:]
     private var blockedUntil: [String: TimeInterval] = [:]
+    // Rejection log lines are rate-limited: a scan must not flood the log.
+    private var lastRejectLog: TimeInterval = -.infinity
+    private var suppressedRejectLogs = 0
+    private var rejectSummaryScheduled = false
 
-    private let maxPending = 4
+    private let maxPending = 32
+    private let maxPendingPerSource = 2       // per IPv4 address or IPv6 /64
+    private let maxPendingPerWideSource = 4   // per IPv6 /48
+    private let maxTrackedSources = 4096
     private let maxFailures = 5
     private let failureWindow: TimeInterval = 600
     private let blockDuration: TimeInterval = 600
@@ -239,6 +261,17 @@ final class RemoteListener {
     func apply(enabled: Bool, port: UInt16, peers: [RemotePeer]) {
         queue.async { [weak self] in
             self?.reconfigure(enabled: enabled, port: port, peers: peers)
+        }
+    }
+
+    /// Main queue. Which peers the controller would refuse right now (user
+    /// disconnected them, or they are connected locally), or everyone.
+    /// Checked before the Mac signs its answer, so a refused device learns
+    /// nothing signed. Takes effect for connections still authenticating.
+    func setRefusals(all: Bool, peerIDs: Set<String>) {
+        queue.async { [weak self] in
+            self?.refuseAll = all
+            self?.refused = peerIDs
         }
     }
 
@@ -280,7 +313,6 @@ final class RemoteListener {
         }
         // No Bonjour service, no peer-to-peer: the port is not announced.
         let params = SecureTransport.parameters(keys: keys)
-        params.allowLocalEndpointReuse = true
         params.includePeerToPeer = false
         let peerCount = keys.count
         keys.removeAll()
@@ -330,18 +362,29 @@ final class RemoteListener {
 
     private func accept(_ conn: NWConnection) {
         let source = Self.sourceKey(of: conn.endpoint)
+        let wideSource = Self.wideSourceKey(of: conn.endpoint)
         pruneFailures()
         if let until = blockedUntil[source], until > now {
             conn.cancel()   // not logged: a blocked scanner would flood the log
             return
         }
-        guard pending.count < maxPending else {
-            Log.info("remote: refused \(source) — \(maxPending) unauthenticated connections already open")
+        // A few slots per source, so one host or prefix cannot hold them all.
+        let fromSource = pending.values.filter { $0.source == source }.count
+        let fromWideSource = wideSource.map { wide in pending.values.filter { $0.wideSource == wide }.count } ?? 0
+        if fromSource >= maxPendingPerSource || fromWideSource >= maxPendingPerWideSource {
+            logRejection("refused \(source) — too many unauthenticated connections from it")
             conn.cancel()
             return
         }
+        // Full: drop the oldest instead of the newcomer, so slow or stalled
+        // dialers cannot keep a legitimate device out for long.
+        if pending.count >= maxPending,
+           let oldest = pending.values.min(by: { $0.acceptedAt < $1.acceptedAt }) {
+            reject(oldest.connection, "evicted: \(maxPending) unauthenticated connections open",
+                   countsAsFailure: false)
+        }
         let id = ObjectIdentifier(conn)
-        pending[id] = conn
+        pending[id] = Pending(connection: conn, source: source, wideSource: wideSource, acceptedAt: now)
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else {
                 conn.cancel()
@@ -349,65 +392,70 @@ final class RemoteListener {
             }
             switch state {
             case .ready:
-                self.authenticate(conn, source: source)
+                self.authenticate(conn)
             case .failed(let error):
                 // A wrong or unknown PSK ends here (TLS handshake failure).
-                self.reject(conn, source: source, "connection failed: \(error)")
+                self.reject(conn, "connection failed: \(error)")
             case .waiting(let error):
-                self.reject(conn, source: source, "connection waiting: \(error)")
+                self.reject(conn, "connection waiting: \(error)")
             case .cancelled:
-                if self.pending[id] === conn { self.pending[id] = nil }
+                if self.pending[id]?.connection === conn { self.pending[id] = nil }
             default:
                 break
             }
         }
         queue.asyncAfter(deadline: .now() + authDeadline) { [weak self] in
-            guard let self, self.pending[id] === conn else { return }
-            self.reject(conn, source: source,
-                        "not authenticated within \(Int(self.authDeadline))s of connecting")
+            guard let self, self.pending[id]?.connection === conn else { return }
+            self.reject(conn, "not authenticated within \(Int(self.authDeadline))s of connecting")
         }
         conn.start(queue: queue)
     }
 
-    private func authenticate(_ conn: NWConnection, source: String) {
+    private func authenticate(_ conn: NWConnection) {
         let id = ObjectIdentifier(conn)
-        guard pending[id] === conn else { return }
+        guard pending[id]?.connection === conn else { return }
         guard let exporter = RemoteAuth.exporter(of: conn) else {
-            return reject(conn, source: source, "no TLS exporter on the connection")
+            return reject(conn, "no TLS exporter on the connection")
         }
         // Exactly one bounded frame; nothing past it is read here.
         RemoteAuth.receiveFrame(on: conn) { [weak self] message in
-            guard let self, self.pending[id] === conn else { return }
-            self.verify(message, on: conn, source: source, exporter: exporter)
+            guard let self, self.pending[id]?.connection === conn else { return }
+            self.verify(message, on: conn, exporter: exporter)
         }
     }
 
-    private func verify(_ message: [String: Any]?, on conn: NWConnection, source: String, exporter: Data) {
+    private func verify(_ message: [String: Any]?, on conn: NWConnection, exporter: Data) {
         let id = ObjectIdentifier(conn)
+        guard let source = pending[id]?.source else { return }
         guard let message else {
-            return reject(conn, source: source, "malformed, oversized or missing authentication frame")
+            return reject(conn, "malformed, oversized or missing authentication frame")
         }
         guard let pid = RemoteAuth.claimedPSKIdentity(message) else {
-            return reject(conn, source: source, "authentication frame without a valid pairing identity")
+            return reject(conn, "authentication frame without a valid pairing identity")
         }
         guard let peer = peers.first(where: { $0.pskIdentity == pid }) else {
-            return reject(conn, source: source, "unknown pairing identity")
+            return reject(conn, "unknown pairing identity")
         }
         guard RemoteAuth.verify(message, from: .device, pskIdentity: pid, exporter: exporter,
                                 peerKey: peer.publicKey) else {
-            return reject(conn, source: source,
-                          "signature for \(peer.name) (\(peer.id.prefix(8))) does not verify")
+            return reject(conn, "signature for \(peer.name) (\(peer.id.prefix(8))) does not verify")
+        }
+        // The device proved who it is, but the Mac would turn it away: close
+        // before signing anything for it. Not a failure of the source.
+        if refuseAll || refused.contains(peer.id) {
+            return reject(conn, "\(peer.name) (\(peer.id.prefix(8))) is not accepted right now",
+                          countsAsFailure: false)
         }
         guard let identity = SecureEnclaveIdentity.shared,
               let reply = try? RemoteAuth.message(.mac, pskIdentity: pid, exporter: exporter,
                                                   identity: identity),
               let frame = RemoteAuth.frame(reply) else {
-            return reject(conn, source: source, "could not sign the Mac's answer", countsAsFailure: false)
+            return reject(conn, "could not sign the Mac's answer", countsAsFailure: false)
         }
         conn.send(content: frame, completion: .contentProcessed { [weak self] error in
-            guard let self, self.pending[id] === conn else { return }
+            guard let self, self.pending[id]?.connection === conn else { return }
             if let error {
-                return self.reject(conn, source: source, "answer not sent: \(error)", countsAsFailure: false)
+                return self.reject(conn, "answer not sent: \(error)", countsAsFailure: false)
             }
             self.pending[id] = nil
             self.failures[source] = nil
@@ -425,23 +473,46 @@ final class RemoteListener {
 
     /// Ends a pending connection. A no-op once it has authenticated (the
     /// session layer owns it then) or was already rejected.
-    private func reject(_ conn: NWConnection, source: String, _ reason: String,
-                        countsAsFailure: Bool = true) {
+    private func reject(_ conn: NWConnection, _ reason: String, countsAsFailure: Bool = true) {
         let id = ObjectIdentifier(conn)
-        guard pending[id] === conn else { return }
+        guard let entry = pending[id], entry.connection === conn else { return }
+        let source = entry.source
         pending[id] = nil
         conn.cancel()
-        Log.info("remote: rejected \(source) — \(reason)")
+        logRejection("rejected \(source) — \(reason)")
         guard countsAsFailure else { return }
         var recent = (failures[source] ?? []).filter { now - $0 < failureWindow }
         recent.append(now)
         if recent.count >= maxFailures {
             failures[source] = nil
             blockedUntil[source] = now + blockDuration
-            Log.info("remote: \(source) blocked for \(Int(blockDuration / 60)) min after \(maxFailures) failed attempts")
+            logRejection("\(source) blocked for \(Int(blockDuration / 60)) min after \(maxFailures) failed attempts")
         } else {
             failures[source] = recent
         }
+        pruneFailures()
+    }
+
+    /// At most one rejection line per second; the rest are counted and
+    /// reported in a summary.
+    private func logRejection(_ text: String) {
+        let now = self.now
+        guard now - lastRejectLog >= 1 else {
+            suppressedRejectLogs += 1
+            guard !rejectSummaryScheduled else { return }
+            rejectSummaryScheduled = true
+            queue.asyncAfter(deadline: .now() + 10) { [weak self] in
+                guard let self else { return }
+                self.rejectSummaryScheduled = false
+                guard self.suppressedRejectLogs > 0 else { return }
+                Log.info("remote: \(self.suppressedRejectLogs) more rejection(s) not logged individually")
+                self.suppressedRejectLogs = 0
+                self.lastRejectLog = self.now
+            }
+            return
+        }
+        lastRejectLog = now
+        Log.info("remote: \(text)")
     }
 
     private func pruneFailures() {
@@ -451,9 +522,19 @@ final class RemoteListener {
             let recent = list.filter { now - $0 < failureWindow }
             return recent.isEmpty ? nil : recent
         }
-        // Bound the memory a scan from many sources can take.
-        if failures.count > 4096 { failures.removeAll() }
-        if blockedUntil.count > 4096 { blockedUntil.removeAll() }
+        // Bound the memory a scan from many sources can take: drop the
+        // stalest entries (oldest last failure, soonest unblock), keeping
+        // the recent ones that matter.
+        if failures.count > maxTrackedSources {
+            let stale = failures.sorted { ($0.value.last ?? 0) < ($1.value.last ?? 0) }
+                .prefix(failures.count - maxTrackedSources * 3 / 4)
+            for (key, _) in stale { failures[key] = nil }
+        }
+        if blockedUntil.count > maxTrackedSources {
+            let stale = blockedUntil.sorted { $0.value < $1.value }
+                .prefix(blockedUntil.count - maxTrackedSources * 3 / 4)
+            for (key, _) in stale { blockedUntil[key] = nil }
+        }
     }
 
     /// The unit failures are counted in: an IPv4 address, or an IPv6 /64
@@ -479,6 +560,19 @@ final class RemoteListener {
         @unknown default:
             return "\(host)"
         }
+    }
+
+    /// The wider unit pending slots are also capped in: an IPv6 /48 (one
+    /// site). nil for IPv4 and IPv4-mapped sources.
+    static func wideSourceKey(of endpoint: NWEndpoint) -> String? {
+        guard case .hostPort(let host, _) = endpoint, case .ipv6(let address) = host else { return nil }
+        let b = [UInt8](address.rawValue)
+        guard b.count == 16 else { return nil }
+        if b[0..<10].allSatisfy({ $0 == 0 }), b[10] == 0xFF, b[11] == 0xFF { return nil }
+        let groups = stride(from: 0, to: 6, by: 2).map {
+            String(UInt16(b[$0]) << 8 | UInt16(b[$0 + 1]), radix: 16)
+        }
+        return groups.joined(separator: ":") + "::/48"
     }
 
     private func publish(_ text: String) {
@@ -556,6 +650,8 @@ extension SenderController {
         remoteListener.onStatus = { [weak self] text in
             MainActor.assumeIsolated { self?.remoteListenerStatus = text }
         }
+        reloadRemotePeers()
+        updateRemoteRefusals()
         if remoteAccessEnabled || !remotePeers.isEmpty, SecureEnclaveIdentity.shared == nil {
             Log.info("remote: no Secure Enclave identity (\(SecureEnclaveIdentity.lastError ?? "unknown")) — remote access disabled")
         }
@@ -586,6 +682,7 @@ extension SenderController {
             Log.info("remote: access disabled by the user — ending remote sessions")
             for session in sessions where session.isRemote { end(session) }
         }
+        updateRemoteRefusals()
         applyRemoteListener()
         refreshRemoteAddresses()
     }
@@ -627,26 +724,51 @@ extension SenderController {
         pushRemoteHostUpdates()
     }
 
+    /// Reads the paired devices. A failed read leaves the last known list in
+    /// place and shows an error: it never passes for "no device paired".
+    func reloadRemotePeers() {
+        do {
+            remotePeers = try RemoteStore.peers()
+            remotePeersError = nil
+        } catch {
+            Log.info("remote: cannot read the paired devices from the Keychain: \(error)")
+            remotePeersError = "Lecture du trousseau impossible (\(error)) : la liste des appareils "
+                + "appairés n'est pas disponible."
+        }
+    }
+
     /// Re-read the peers after a USB pairing completed.
     func remotePairingsChanged() {
-        remotePeers = RemoteStore.peers()
+        reloadRemotePeers()
+        updateRemoteRefusals()
         applyRemoteListener()
         refreshRemoteAddresses()
     }
 
     /// Revocation (PROTOCOL.md 2.4.6): the key leaves the listener and any
-    /// live session with the device ends now.
+    /// live session with the device ends now. If the Keychain cannot be
+    /// updated the device stays listed (it is still stored), with an error,
+    /// and is refused until this app quits.
     func forgetRemotePeer(_ peer: RemotePeer) {
-        let remaining = RemoteStore.peers().filter { $0.id != peer.id }
-        do {
-            try RemoteStore.savePeers(remaining)
-        } catch {
-            Log.info("remote: could not update the Keychain while forgetting \(peer.name): \(error)")
-        }
-        remotePeers = remaining
         let sessionID = ConnectionTarget.remote(peerID: peer.id).sessionID
         for session in sessions where session.id == sessionID { end(session) }
         remoteSuppressedUntil[peer.id] = nil
+        let remaining: [RemotePeer]
+        do {
+            remaining = try RemoteStore.peers().filter { $0.id != peer.id }
+            try RemoteStore.savePeers(remaining)
+        } catch {
+            Log.info("remote: could not forget \(peer.name) (\(peer.id.prefix(8))): \(error) — still stored")
+            remoteForgetFailed.insert(peer.id)
+            remotePeersError = "Impossible d'oublier \(peer.name) (\(error)) : l'appairage est toujours "
+                + "enregistré. Ses connexions sont refusées jusqu'à la fermeture de l'app ; réessaie."
+            updateRemoteRefusals()
+            return
+        }
+        remotePeers = remaining
+        remotePeersError = nil
+        remoteForgetFailed.remove(peer.id)
+        updateRemoteRefusals()
         applyRemoteListener()
         Log.info("remote: forgot \(peer.name) (\(peer.id.prefix(8)))")
     }
@@ -654,14 +776,40 @@ extension SenderController {
     /// The user disconnected a remote session: its device redials on its
     /// own, so turn it away for a minute rather than reopen at once.
     func suppressRemote(_ peerID: String) {
-        remoteSuppressedUntil[peerID] = Date().addingTimeInterval(60)
+        let delay: TimeInterval = 60
+        remoteSuppressedUntil[peerID] = Date().addingTimeInterval(delay)
+        updateRemoteRefusals()
+        // Let it back in once the minute is over.
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 1) { [weak self] in
+            self?.updateRemoteRefusals()
+        }
     }
 
-    /// A device passed RemoteListener's authentication.
+    /// The peers the listener must turn away before it signs anything:
+    /// suppressed after a user disconnect, forgotten but not erased, or
+    /// already connected locally. Everyone while the feature is off.
+    /// Called whenever sessions, suppression, peers or the toggle change.
+    func updateRemoteRefusals() {
+        let now = Date()
+        remoteSuppressedUntil = remoteSuppressedUntil.filter { $0.value > now }
+        var refused = Set(remoteSuppressedUntil.keys).union(remoteForgetFailed)
+        let localInstallIDs = Set(sessions.compactMap { s -> String? in
+            guard !s.failed, !s.isRemote else { return nil }
+            return s.deviceID
+        })
+        for peer in remotePeers {
+            if let installID = peer.installID, localInstallIDs.contains(installID) { refused.insert(peer.id) }
+        }
+        remoteListener.setRefusals(all: !remoteAccessEnabled, peerIDs: refused)
+    }
+
+    /// A device passed RemoteListener's authentication. The listener already
+    /// refused what was known to be refused; this is the second line, against
+    /// the state as it is now on the main thread.
     func handleRemoteConnection(_ conn: NWConnection, peer: RemotePeer) {
         // Re-check against the current state: the user may have forgotten
         // the peer or turned the feature off while the hop was in flight.
-        guard remoteAccessEnabled,
+        guard remoteAccessEnabled, !remoteForgetFailed.contains(peer.id),
               let current = remotePeers.first(where: { $0.id == peer.id && $0.pskIdentity == peer.pskIdentity })
         else {
             Log.info("remote: \(peer.name) is no longer allowed — closing its connection")
@@ -673,7 +821,6 @@ extension SenderController {
             conn.cancel()
             return
         }
-        remoteSuppressedUntil[current.id] = nil
         // One session per physical device: a local one wins.
         if let installID = current.installID,
            let local = sessions.first(where: { !$0.failed && !$0.isRemote && $0.deviceID == installID }) {
@@ -684,6 +831,7 @@ extension SenderController {
         let target = ConnectionTarget.remote(peerID: current.id)
         if let existing = session(for: target.sessionID), !existing.failed {
             // Reconnect within the grace (or a replacement): same display.
+            // Logged, not announced: the user was told when it opened.
             Log.info("remote: \(current.name) reconnected — resuming its session")
             existing.sender.adoptInbound(conn)
             return
@@ -693,38 +841,61 @@ extension SenderController {
         RemoteNotificationPresenter.announceRemoteSession(from: current.name)
     }
 
+    /// A session's transport is the USB cable right now, dialed by this Mac
+    /// through usbmuxd. Only such a session's install ID is backed by
+    /// something stronger than the receiver's own word: a WiFi device (even
+    /// a code-paired one) could claim any install ID in its hello.
+    private func isCabled(_ session: DeviceSession) -> Bool {
+        guard case .usb = session.target else { return false }
+        return session.onUSB && session.usbUDID != nil
+    }
+
     /// Every hello, on any transport.
     func remoteHelloReceived(_ info: PhoneInfo, session: DeviceSession) {
-        guard let installID = info.id else { return }
-        if !session.isRemote {
-            // The device is here locally now (USB or WiFi): the cable/LAN
-            // session wins, the remote one for the same device ends.
+        if let installID = info.id, isCabled(session) {
+            // The device is on the cable now: the USB session wins, the
+            // remote one for the same device ends. A WiFi session never
+            // ends a remote one (its install ID is only claimed).
             let peerIDs = Set(remotePeers.filter { $0.installID == installID }.map(\.id))
             for twin in sessions where twin.isRemote {
                 guard case .remote(let peerID) = twin.target,
                       twin.deviceID == installID || peerIDs.contains(peerID) else { continue }
-                Log.info("remote: \(twin.name) is now connected locally (\(session.id)) — ending its remote session")
+                Log.info("remote: \(twin.name) is now connected over USB (\(session.id)) — ending its remote session")
                 end(twin)
             }
         }
-        sendRemoteHostUpdate(to: session, installID: installID)
+        updateRemoteRefusals()
+        sendRemoteHostUpdate(to: session)
     }
 
-    /// PROTOCOL.md 2.4.5: tell a remote peer where to find this Mac.
-    private func sendRemoteHostUpdate(to session: DeviceSession, installID: String) {
-        guard !session.failed, remotePeers.contains(where: { $0.installID == installID }),
-              !remoteAddresses.isEmpty, SecureEnclave.isAvailable,
-              let identity = SecureEnclaveIdentity.shared else { return }
-        session.sender.sendControlMessage(RemoteHostUpdate.message(
-            macFingerprint: identity.fingerprint, addresses: remoteAddresses, port: RemoteSettings.port))
+    /// PROTOCOL.md 2.4.5: tell a paired device where to find this Mac. Only
+    /// on remote sessions (authenticated by the device's key) and cabled
+    /// sessions: never over WiFi, where the install ID is only claimed.
+    private func sendRemoteHostUpdate(to session: DeviceSession) {
+        // deviceID is set by the hello: nothing goes out before it.
+        guard !session.failed, session.deviceID != nil, !remoteAddresses.isEmpty,
+              SecureEnclave.isAvailable else { return }
+        let isPeer: Bool
+        if case .remote(let peerID) = session.target {
+            isPeer = remotePeers.contains { $0.id == peerID }
+        } else if isCabled(session), let installID = session.deviceID {
+            isPeer = remotePeers.contains { $0.installID == installID }
+        } else {
+            isPeer = false
+        }
+        guard isPeer, let identity = SecureEnclaveIdentity.shared else { return }
+        do {
+            let update = try RemoteHostUpdate.message(identity: identity, addresses: remoteAddresses,
+                                                      port: RemoteSettings.port)
+            session.sender.sendControlMessage(update)
+        } catch {
+            Log.info("remote: cannot sign the address update for \(session.id): \(error)")
+        }
     }
 
     /// Addresses or port changed: update every connected remote peer.
     func pushRemoteHostUpdates() {
-        for session in sessions {
-            guard let installID = session.deviceID else { continue }
-            sendRemoteHostUpdate(to: session, installID: installID)
-        }
+        for session in sessions { sendRemoteHostUpdate(to: session) }
     }
 }
 
@@ -782,6 +953,15 @@ struct RemoteAccessSection: View {
                     Text(controller.remoteListenerStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+            }
+            if let error = controller.remotePeersError {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    Button("Relire") { controller.remotePairingsChanged() }
+                        .controlSize(.small)
                 }
             }
             ForEach(controller.remotePeers) { peer in

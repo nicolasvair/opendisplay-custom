@@ -191,7 +191,10 @@ final class SenderController: ObservableObject {
         }
     }
 
-    @Published var sessions: [DeviceSession] = []
+    @Published var sessions: [DeviceSession] = [] {
+        // Remote access turns away devices that have a local session.
+        didSet { updateRemoteRefusals() }
+    }
     @Published var discovered: [NWBrowser.Result] = []
     @Published var usbDevices: [UsbmuxDevice] = []
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
@@ -268,7 +271,14 @@ final class SenderController: ObservableObject {
     @Published var remotePortText = String(RemoteSettings.port)
     // Edited as text, applied on submit (commitRemotePublicHost).
     @Published var remotePublicHost = RemoteSettings.publicHost ?? ""
-    @Published var remotePeers: [RemotePeer] = RemoteStore.peers()
+    // Read from the Keychain in setUpRemoteAccess (reloadRemotePeers).
+    @Published var remotePeers: [RemotePeer] = []
+    // A Keychain read or a forget failed: shown in settings, never mistaken
+    // for an empty list.
+    @Published var remotePeersError: String?
+    // Peers whose forget could not be saved: still stored, refused anyway
+    // until the app quits.
+    var remoteForgetFailed: Set<String> = []
     @Published var remoteAddresses: [String] = []
     @Published var remoteListenerStatus = ""
     let remoteListener = RemoteListener()
@@ -738,7 +748,7 @@ final class SenderController: ObservableObject {
             if case .usb(let udid?) = session.target, let installID = info.id {
                 self.installIDByUDID[udid] = installID
             }
-            // Remote access: address update for remote peers, and a local
+            // Remote access: address update for remote peers, and a USB
             // session takes over from a remote one for the same device.
             self.remoteHelloReceived(info, session: session)
             self.dedupeSessions()
@@ -835,6 +845,7 @@ final class SenderController: ObservableObject {
                 // live-looking session would swallow every future connect.
                 session.failed = true
                 sender.stop()
+                self.updateRemoteRefusals()
             }
         }
     }
@@ -863,6 +874,12 @@ final class SenderController: ObservableObject {
     func retry(_ session: DeviceSession) {
         let target = session.target
         end(session)
+        // A remote session cannot be redialed: ending it is all a retry can
+        // do. The device redials on its own and gets a fresh session.
+        if case .remote = target {
+            Log.info("retry of \(session.id): remote session ended — waiting for the device to reconnect")
+            return
+        }
         connect(to: target, userInitiated: true)
     }
 
@@ -877,7 +894,16 @@ final class SenderController: ObservableObject {
         let targets = sessions.map(\.target)
         sessions.forEach { $0.sender.stop() }
         sessions.removeAll()
-        targets.forEach { connect(to: $0) }
+        // Remote sessions are never dialed by the Mac: stopping one closes its
+        // connection and the device redials into a session built with the
+        // new settings.
+        for target in targets {
+            if case .remote = target {
+                Log.info("restart: remote session \(target.sessionID) ended — the device will reconnect")
+                continue
+            }
+            connect(to: target)
+        }
         autoConnect()   // a rebuilt WiFi session may deserve its cable back
     }
 
