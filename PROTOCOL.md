@@ -60,10 +60,26 @@ over USB (dial a tunneled port), and one code path serves both transports.
   messages, and telemetry all share it, in both directions. The one
   optional exception is the UDP cursor side channel (section 6.3), which
   carries nothing a receiver cannot also get over TCP.
-* There is no TLS and no authentication at `pv` 3. The protocol is designed
-  for trusted local networks and direct cables. Implementations SHOULD
-  disable Nagle's algorithm (TCP_NODELAY); input events are tiny packets and
-  coalescing them reads as input lag.
+* The **stock** protocol has no TLS and no authentication at `pv` 3: it was
+  designed for trusted local networks and direct cables. The **custom
+  build** of the apps (this fork) secures the transport without touching
+  anything from section 3 on, which runs unchanged inside the secured
+  stream:
+  * **USB** (section 2.2) stays plaintext. usbmuxd delivers the connection
+    to the receiver from loopback, and the cable itself is the trust
+    anchor.
+  * **WiFi/LAN** runs only over **TLS 1.2 with a pre-shared key**, on base
+    port + 2 (9002), after a one-time code pairing (section 2.3). A custom
+    receiver refuses every non-loopback connection to its plaintext port,
+    and a custom sender never dials plaintext over the network.
+  * **Remote access** from outside the LAN uses its own binding with the
+    dialing roles reversed, TLS 1.2 PSK plus a Secure Enclave signature
+    bound to the TLS session, and a USB-only pairing (section 2.4).
+
+  A custom peer is therefore **not** interoperable with a stock peer over
+  the network; over USB it is.
+* Implementations SHOULD disable Nagle's algorithm (TCP_NODELAY); input
+  events are tiny packets and coalescing them reads as input lag.
 * A receiver serves **one sender at a time**. When a new inbound connection
   arrives while one is active, the receiver MUST adopt the new connection
   and drop the old one (the official receiver cancels the old connection
@@ -73,7 +89,8 @@ over USB (dial a tunneled port), and one code path serves both transports.
 
 The core protocol is transport-agnostic beyond "a TCP byte stream to port
 9000 on the receiver". How the sender finds that port is a *binding*. Two
-bindings exist today; ports to other platforms MAY define their own (for
+stock bindings exist today (2.1, 2.2); the custom build adds two more
+(2.3, 2.4). Ports to other platforms MAY define their own (for
 example an Android receiver reachable over `adb reverse`) without touching
 anything else in this document.
 
@@ -107,6 +124,346 @@ and the protocol proceeds exactly as over WiFi.
 Bonjour plays no role on this path. The official receiver classifies a
 connection arriving from loopback as "USB" purely for its stats display;
 this has no protocol significance.
+
+In the custom build, arriving from loopback does carry significance: it is
+the only way a plaintext connection is accepted at all (section 2.3).
+
+### 2.3 Paired WiFi (custom build)
+
+This binding replaces 2.1 in the custom build. Stock peers do not speak it,
+and a custom receiver does not accept a stock sender over the network.
+It applies to the iOS/iPadOS receiver and to the Mac receiver app alike.
+
+**Ports.** "Base" is the receiver's stream port, 9000 by default.
+
+| Port | Transport | Bound when | Bonjour | Purpose |
+|---|---|---|---|---|
+| base (9000) | TCP, plaintext | always | not advertised | USB only: a connection whose peer address is not loopback MUST be refused |
+| base + 1 (9001) | UDP | never | — | The cursor side channel (6.3) is not offered: it is unauthenticated. `hello` carries no `cursorPort` |
+| base + 2 (9002) | TCP, TLS 1.2 PSK | at least one Mac is paired | `_opensidecar._tcp`, TXT `id`, `pv`, `tls=1` | WiFi/LAN sessions |
+| base + 3 (9003) | TCP, plaintext | only while the receiver's pairing screen is open, at most 120 s | `_opensidecar._tcp`, name + `" (appairage)"`, TXT `id`, `pair=1` | Code pairing dialogue |
+| base + 4 (9004) | TCP, plaintext | see 2.4 | not advertised | Remote-access pairing, loopback only (2.4) |
+
+Both advertised listeners reuse the stock service type and are told apart by
+their TXT flag: macOS authorizes Bonjour browsing per service type and keeps
+the list an app had when Local Network access was granted, so a new type
+would be refused on an already-authorized Mac. A custom sender MUST dial only
+results flagged `tls=1` for sessions and only results flagged `pair=1` for
+pairing; it MUST NOT dial a receiver over the network in plaintext.
+
+**Pairing dialogue.** The sender dials the pairing listener. Messages are
+UTF-8 JSON objects, **one per line** (terminated by `\n`, 0x0A), not
+length-prefixed; a peer MAY close the dialogue once more than 16 KiB is
+buffered without a newline. Binary values are standard base64 (RFC 4648
+section 4, padded).
+
+| Step | Direction | `type` | Fields |
+|---|---|---|---|
+| 1 | sender → receiver | `pairHello` | `macID` (the sender's pairing ID, a UUID string), `macName`, `commit` = SHA-256(sender X25519 public key), 32 bytes |
+| 2 | receiver → sender | `pairKey` | `id` (the receiver's install ID, as in TXT `id`), `pk` = receiver X25519 public key (raw, 32 bytes) |
+| 3 | sender → receiver | `pairReveal` | `pk` = sender X25519 public key (raw, 32 bytes) |
+| 4 | sender → receiver | `pairConfirm` | `tag` = HMAC-SHA256(key = secret, message = `"mac-confirm"`) |
+| 5 | receiver → sender | `pairDone` | `tag` = HMAC-SHA256(key = secret, message = `"receiver-confirm"`) |
+| any | either | `pairAbort` | none |
+
+The receiver MUST check that `pairReveal.pk` hashes to the committed value.
+With `M` the sender's and `R` the receiver's raw X25519 public keys and `Z`
+their X25519 shared secret:
+
+* `code` = the first 4 bytes of SHA-256(`"opendisplay-pairing-code-v1"` ‖ `M`
+  ‖ `R`) read as a big-endian unsigned integer, modulo 1 000 000, written as
+  6 decimal digits with leading zeros.
+* `secret` = HKDF-SHA256(IKM = `Z`, salt = `M` ‖ `R`, info =
+  `"opendisplay-psk-v1"`, L = 32).
+
+The receiver shows `code` after step 3; the user types it on the sender,
+which sends `pairConfirm` only when it matches (the official sender aborts
+after 3 wrong entries). The receiver checks the tag, asks its user to accept
+the sender, stores (`macID`, name, `secret`), and answers `pairDone`; the
+sender checks that tag and stores (`id`, name, `secret`). Any unexpected,
+malformed or out-of-order message, a bad tag, a rejection or the 120 s
+timeout ends the attempt with `pairAbort` and nothing stored. Because the
+sender commits to `M` before seeing `R`, a man in the middle cannot search
+for a key pair that gives both sides the same code; it ends up with a
+different code on each side.
+
+**Session.** The sender dials base + 2 with TLS **1.2 only** and the single
+cipher suite `TLS_PSK_WITH_AES_128_GCM_SHA256` (0x00A8, RFC 5487), PSK
+identity = the UTF-8 bytes of `macID`, PSK = `secret`. The receiver's
+listener holds the PSK of every paired sender and selects it by identity.
+Once the handshake completes, the protocol of sections 3 to 9 runs
+unchanged inside TLS. Forgetting a pairing on the receiver rebuilds its
+TLS listener and drops a live network session admitted under it; forgetting
+it on the sender stops the sender from dialing.
+
+### 2.4 Remote access (custom build)
+
+Remote access lets an iPhone or iPad reach its Mac from outside the local
+network, over IPv6 or an overlay network such as Tailscale. A phone on a
+cellular network usually sits behind carrier NAT and cannot be dialed, so
+on this binding the **dialing roles are reversed**: the **Mac listens** and
+the **device dials**. Only the transport roles flip. At the message level
+the device is still the receiver and the Mac the sender: the device sends
+`hello` first and everything from section 3 on applies, with the changes
+listed below.
+
+The Mac's port can be reached from the whole Internet, so this binding is
+stricter than 2.3. Remote access is defined between the Mac sender and the
+iOS/iPadOS receiver only; the Mac receiver app does not implement it.
+
+#### 2.4.1 Identities
+
+* Each end MUST hold a long-term **P-256 signing key generated in its Secure
+  Enclave**, non-exportable. A peer without a usable Secure Enclave MUST NOT
+  offer remote access: there is no software fallback, because a software
+  key can be copied, and ruling out a copied identity is the point.
+* A public key is sent as its X9.63 uncompressed form (65 bytes). Signatures
+  are ECDSA P-256 over SHA-256 of the message, encoded raw as `r` ‖ `s`
+  (64 bytes).
+* A peer's **fingerprint** is the lowercase hex of the first 16 bytes of
+  SHA-256(its X9.63 public key): 32 characters. Peers MUST be stored and
+  looked up by fingerprint, never by a name or ID the peer chose, so that
+  one pairing cannot overwrite another.
+* Each pairing has its own 256-bit secret (the TLS PSK). At rest it MUST be
+  protected so that a copy of the stored data on another machine is
+  useless; the official apps seal it with ECIES to a second, Secure
+  Enclave key-agreement key (ephemeral P-256, HKDF-SHA256 with salt = the
+  ephemeral public key and info `"opendisplay-remote-seal-v1"`, AES-256-GCM).
+
+#### 2.4.2 Ports
+
+| Port | Where | Transport | Bound when |
+|---|---|---|---|
+| base + 4 (9004) | device | TCP, plaintext, **loopback only** | only after the user opens the remote-pairing screen, at most 120 s, one Mac at a time |
+| 9010 (user-configurable) | Mac | TCP, TLS 1.2 PSK, all interfaces | only while the user has enabled remote access (off by default) |
+
+Neither listener is advertised over Bonjour. The device listener MUST
+refuse any connection whose peer address is not loopback: it is meant to be
+reached only through usbmuxd. The Mac SHOULD NOT listen while no remote
+peer is paired.
+
+#### 2.4.3 USB pairing
+
+Remote access exists **only** for peers paired by this dialogue. A code
+pairing over WiFi (2.3) MUST NOT create or modify a remote peer. The Mac
+reaches the device's pairing listener through usbmuxd (`Connect` to base +
+4, as in 2.2), so the cable proves which two devices are talking; both
+screens then show a code derived from the whole exchange, and the user
+accepts on both.
+
+The dialogue uses the line framing of 2.3 (one JSON object per line,
+base64 per RFC 4648 section 4):
+
+```
+Mac    -> device  rpHello   {v, name, sk, ek, pid}
+device -> Mac     rpHello   {v, name, sk, ek, iid}
+          (both screens show code(T); the user accepts on each device)
+Mac    -> device  rpConfirm {sig, addrs, port}
+device -> Mac     rpConfirm {sig}
+either            rpAbort   {}
+```
+
+**`rpHello`** fields:
+
+| Field | Sent by | Value |
+|---|---|---|
+| `type` | both | `"rpHello"` |
+| `v` | both | `1`, the version of this scheme. A hello with any other `v` MUST be rejected |
+| `name` | both | Display name, non-empty, at most 64 characters |
+| `sk` | both | Long-term Secure Enclave signing public key, X9.63, 65 bytes, base64 |
+| `ek` | both | A fresh X25519 public key for this pairing only, raw, 32 bytes, base64 |
+| `pid` | Mac | The PSK identity the Mac assigns to this pairing: 16 random bytes as 32 **lowercase** hex characters. Random, so it reveals nothing about either device |
+| `iid` | device, optional | The device's install ID (TXT/`hello` `id`), at most 64 characters, so the Mac can recognize the device on USB and WiFi sessions |
+
+A peer MUST reject a hello whose `sk` is not a valid P-256 point, whose
+`ek` is not a valid X25519 key, or (from the Mac) whose `pid` is not 32
+lowercase hex characters. The official apps truncate `name` and `iid` to 64
+characters and substitute a default for an empty `name`; since the
+transcript covers these values as received, a sender MUST NOT send an
+empty or longer value, or the two sides compute different transcripts.
+
+**Transcript.** Both sides compute
+
+```
+T = SHA-256( "opendisplay-remote-pair-v1"
+             ‖ LV(mac.sk) ‖ LV(mac.ek) ‖ LV(mac.name) ‖ LV(mac.pid)
+             ‖ LV(dev.sk) ‖ LV(dev.ek) ‖ LV(dev.name) ‖ LV(dev.iid) )
+```
+
+where the leading label is its raw ASCII bytes (no length, no terminator),
+`LV(x)` is a 4-byte big-endian unsigned length followed by the bytes of
+`x`, keys are their decoded binary forms (65 and 32 bytes), text fields are
+their UTF-8 bytes, and an absent `iid` is the empty string (length 0). Any
+field changed in transit gives a different `T`, so a different code and
+signatures that fail.
+
+**Code.** The 6-digit code is the first 4 bytes of SHA-256(
+`"opendisplay-remote-code-v1"` ‖ `T`) read as a big-endian unsigned
+integer, modulo 1 000 000, with leading zeros. Both screens show it; the
+user checks that they match and accepts on **each** device. A rejection on
+either side sends `rpAbort`.
+
+**PSK.** With `Z` the X25519 shared secret of the two `ek` keys:
+`PSK` = HKDF-SHA256(IKM = `Z`, salt = `T`, info =
+`"opendisplay-remote-psk-v1"`, L = 32). The ephemeral private keys MUST be
+discarded after the pairing.
+
+**`rpConfirm`.** A side sends its `rpConfirm` once its own user has
+accepted, and not before. `sig` is the base64 signature, with its long-term
+key, over the confirm payload
+
+```
+"opendisplay-remote-confirm-v1" 0x00 role 0x00 ‖ T
+```
+
+where `role` is the ASCII string `mac` or `device` naming the signer. The
+Mac's confirm also carries `addrs` (array of strings: the hosts the device
+should dial, in order of preference, as IP literals without brackets or
+zone IDs, or DNS names) and `port` (integer, the Mac's remote listener
+port); these are the initial values `remoteHost` (2.4.5) later updates. The
+confirms are independent: neither side waits for the peer's confirm before
+sending its own, so they MAY cross on the wire.
+
+**Completion.** Each side stores the peer only when **both** hold: its own
+user accepted, and the peer's `rpConfirm` signature verifies against the
+`sk` from the peer's `rpHello`. The Mac stores the device under the
+fingerprint of its `sk` with its name, `sk`, `iid`, `pid` and the protected
+PSK; the device stores the Mac under the fingerprint of its `sk` with its
+name, `sk`, `pid`, the protected PSK, `addrs` and `port`. A new record
+replaces any existing record with the same fingerprint (the same peer
+paired again) or the same `pid`.
+
+**`rpAbort`** carries no other field and may be sent by either side at any
+time. A malformed or unexpected message, a hello that fails validation, a
+confirm signature that does not verify, a rejection on either screen, a
+closed connection or the 120 s timeout ends the attempt: the side that
+detects it sends `rpAbort` if it can, closes, and stores nothing. The
+device closes its pairing listener when the attempt ends.
+
+#### 2.4.4 Session establishment
+
+1. The device dials the Mac's stored `addrs` (in order; an implementation
+   MAY race them) on the stored `port`, with the TLS parameters of 2.3
+   (TLS 1.2 only, `TLS_PSK_WITH_AES_128_GCM_SHA256`), PSK identity = the
+   UTF-8 bytes of `pid`, PSK = the pairing's secret. The Mac's listener
+   holds the PSK of every remote peer and selects it by identity. A wrong
+   or unknown PSK fails the handshake. The Mac SHOULD close a connection
+   whose TLS handshake has not completed within 5 s of being accepted, so
+   an idle or non-TLS client holds nothing open.
+2. Both ends derive `E`, 32 bytes of keying material exported from this TLS
+   session per RFC 5705 with label `"EXPORTER-opendisplay-remote-auth-v1"`
+   and no context value.
+3. The **device speaks first.** Its first frame, framed as in section 3
+   (4-byte big-endian length, then JSON), is
+
+   ```json
+   {"type":"rauth","v":1,"pid":"<pid>","sig":"<base64>"}
+   ```
+
+   with `sig` = sign_device(auth payload(`device`)).
+4. The Mac reads **exactly one** frame and nothing past it. It MUST close
+   the connection, without sending anything, unless all of the following
+   hold within **5 s** of the TLS handshake completing: the payload is
+   1 to **1024** bytes; it parses as a JSON object; `type` is `"rauth"`; `v`
+   is `1`; `pid` is 32 lowercase hex characters naming a paired remote peer;
+   and `sig` verifies against that peer's pinned key over the auth payload
+   with role `device` and that `pid`. A Mac whose TLS stack exposes the
+   negotiated PSK identity SHOULD also require it to equal `pid`.
+5. The Mac answers with its own first frame,
+
+   ```json
+   {"type":"rauth","v":1,"sig":"<base64>"}
+   ```
+
+   with `sig` = sign_mac(auth payload(`mac`)). Before this point the Mac
+   MUST NOT send anything else, create a display, or act on any input.
+6. The device reads exactly one frame (same limits) and verifies it against
+   the Mac key it pinned for this `pid`. It MUST close the connection on
+   failure and MUST NOT send `hello` before the check passes; it SHOULD
+   give up after 5 s.
+7. The session then proceeds as in section 9, starting with the device's
+   `hello`.
+
+The **auth payload** is
+
+```
+"opendisplay-remote-auth-v1" 0x00 role 0x00 pid 0x00 ‖ E
+```
+
+with `role` the ASCII `device` or `mac` naming the signer, `pid` its 32
+ASCII characters, and `E` the 32 exported bytes. Because `E` is unique to
+the TLS session, a signature can be neither replayed on another session
+nor relayed between two sessions; because the key is in the Secure
+Enclave, the PSK alone (for example lifted from a copied Keychain) does not
+authenticate.
+
+#### 2.4.5 `remoteHost`
+
+Sender to receiver, additive (section 6 rules apply: a peer that does not
+know it ignores it):
+
+```json
+{"type":"remoteHost","fp":"<mac fingerprint>","addrs":["2001:db8::1234","mac.example.ts.net"],"port":9010}
+```
+
+| Field | Meaning |
+|---|---|
+| `fp` | The fingerprint (32 lowercase hex characters) of the sending Mac's remote identity |
+| `addrs` | The hosts to dial, in order of preference, in the form of `rpConfirm.addrs` |
+| `port` | The Mac's remote listener port, 1 to 65535 |
+
+The Mac sends it on any session with a device it holds as a remote peer
+(USB, paired WiFi or remote), after the session starts and whenever its
+address set or port changes, so a device follows a changed IPv6 prefix
+without pairing again. The device MUST apply it only to the stored Mac
+whose fingerprint equals `fp`, replacing its `addrs` and `port`, and MUST
+ignore it otherwise. It MAY keep only the first 16 entries and truncate each
+to 255 characters. The Mac SHOULD list stable addresses (on macOS the
+`secured` IPv6 address, not the rotating temporary ones), MUST NOT list
+link-local addresses, and MAY add user-configured names or overlay-network
+addresses (Tailscale). `fp` is a claim on USB and WiFi sessions; a forged
+update can at most make the device dial the wrong host, where
+authentication (2.4.4) fails.
+
+#### 2.4.6 Session rules
+
+These replace the corresponding rules of sections 6.3, 8.2 and 9 on a
+remote session:
+
+* **Liveness.** Each end treats more than **15 s** without any bytes from
+  the other as a dead link (instead of 5 s: cellular paths stall). Both ends
+  SHOULD still send `ping` every 2 s.
+* **No cursor side channel.** The device MUST NOT offer `cursorPort` and the
+  Mac MUST ignore it; cursor positions ride the TLS stream.
+* **Reconnection belongs to the device.** The Mac never dials the device.
+  After a drop the device SHOULD redial promptly (and back off on repeated
+  failures), and the Mac SHOULD keep the session's display for a grace
+  period at least as long as the liveness window, so a short cellular drop
+  resumes the same desktop. `closing` ends the session; `sleeping` tears the
+  display down and waits for the device to dial again.
+* **Replacement.** A newly authenticated connection from a peer that already
+  has a live remote session SHOULD replace it (section 1). A connection that
+  has not completed 2.4.4 MUST NOT affect any live session.
+* **Visibility.** The Mac SHOULD notify its user each time a remote session
+  is authenticated, naming the device, so an unexpected use is noticed.
+* **Revocation.** Forgetting a remote peer on the Mac MUST remove its PSK
+  from the listener and close any live session with it immediately.
+  Forgetting the Mac on the device deletes the stored record; the device
+  MUST then stop dialing it.
+
+#### 2.4.7 Security notes (non-normative)
+
+* Protected: the pre-authentication surface (a scanner gets a TLS PSK
+  handshake that fails without a pairing secret, then at most one 1 KiB
+  frame and 5 s), a stolen or copied Keychain, a Mac or device restored or
+  migrated from a paired one (new Secure Enclave, new identity), a device
+  paired with another Mac, and a passive or active network attacker.
+* Not protected: TLS 1.2 with a plain PSK has **no forward secrecy**: whoever
+  obtains a pairing's PSK later can decrypt recorded sessions of that
+  pairing. TLS 1.3 PSK with (EC)DHE would fix this if the platform supports
+  it (`tools/remote-spike.swift` checks). Malware running on the genuine,
+  unlocked device can use its Secure Enclave key in place. The port's
+  existence is visible to a scanner.
 
 ## 3. Framing
 
@@ -589,6 +946,12 @@ Sender to receiver:
 |---|---|---|
 | `displays` | `list`, `selected`? | The Mac screens that can be mirrored and the one in use |
 | `streamConfig` | adds `mode` | In addition to the fields of section 6.5, the sender's current mode (`"extend"` or `"mirror"`), so the receiver can show its switch |
+| `remoteHost` | `fp`, `addrs`, `port` | The Mac's current remote-access addresses, so a device paired for remote access follows a changed IPv6 prefix (section 2.4.5) |
+
+The remote-access binding (section 2.4) also defines `rauth`, the first
+frame in each direction of a remote session. It is part of session
+establishment, not a control message: it is never sent once `hello` has
+been exchanged, and a peer that receives it later MUST ignore it.
 
 **`displays`**: `list` is an array of `{"id", "name", "w", "h", "main"}`:
 `id` is the screen's CGDisplay UUID (stable across reboots and display
@@ -667,6 +1030,9 @@ apps send theirs every **2 s**. An implementation MAY use different
 timeouts but SHOULD keep the 2 s ping cadence so it stays comfortably
 inside its peer's window.
 
+On a remote-access session (section 2.4) the silence window is 15 s, and
+reconnection is the device's job, since the Mac cannot dial it (2.4.6).
+
 Reconnection policy is the dialing sender's business, not the protocol's.
 For the record, the official sender: redials ~1 s after a failure, gives
 each dial attempt 5 s (a dial to a withdrawn Bonjour name hangs forever
@@ -719,6 +1085,9 @@ Rules already stated elsewhere, gathered:
 * A new inbound connection replaces the current one (section 1).
 * Silence over ~5 s is death (8.2); `sleeping`/`closing` are best-effort
   courtesies, absence of them means nothing (6.1).
+* Custom build: on a remote session, `rauth` in both directions (device
+  first) precedes `hello`, and nothing else is read or sent before it
+  checks out (2.4.4).
 
 ## 10. Versioning and evolution
 
@@ -803,3 +1172,4 @@ This file is versioned by git; the authoritative change log is
 |---|---|
 | 2026-08-19 | Initial specification, written against `pv` 3 |
 | 2026-08-26 | Additive: `hello.cursorPort` and the UDP cursor side channel (section 6.3) |
+| 2026-10-11 | Custom build: section 1 no longer claims there is no TLS; paired WiFi binding with TLS 1.2 PSK (section 2.3); remote access binding with USB pairing, Secure Enclave identities, `rauth` and `remoteHost` (sections 2.4, 6.6) |

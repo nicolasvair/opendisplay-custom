@@ -11,6 +11,16 @@
 >   commit/reveal, HMAC confirmation). WiFi then runs only over TLS 1.2 PSK;
 >   unpaired WiFi devices are refused. USB stays plaintext. Works for the iPad
 >   and the Mac receiver; pairings are kept in the Keychain and can be forgotten.
+>   This WiFi pairing does **not** grant remote access (below). Wire details:
+>   [PROTOCOL.md](PROTOCOL.md) section 2.3.
+> - **Remote access (opt-in, iPhone/iPad only).** Reach the Mac from outside
+>   the LAN, over IPv6 or Tailscale: the Mac listens on TCP 9010 (off by
+>   default) and the device dials. Pairing for it is done **over USB only**,
+>   with a code shown on both screens; each side keeps a non-exportable
+>   Secure Enclave key, and every session is TLS 1.2 PSK plus a Secure
+>   Enclave signature bound to that TLS session. Guide, security model and
+>   test checklist (in French): [REMOTE_ACCESS.md](REMOTE_ACCESS.md);
+>   wire details: [PROTOCOL.md](PROTOCOL.md) section 2.4.
 > - **Local controls on the iPad.** The control bar lives on the iPad, in
 >   space reserved below the picture (the desktop is announced that much
 >   shorter).
@@ -351,6 +361,17 @@ under Membership, or just pick your team in Xcode's Signing pane.)
 Open the iPhone app, then pick **"iPhone (WiFi)"** from the Connection menu
 in the Mac app. Discovery is automatic via Bonjour. USB has lower latency;
 WiFi has no cable.
+
+### Remote access (custom build)
+
+To use the iPhone or iPad as a display while away from the Mac's network,
+pair it once **over USB** for remote access, enable the remote listener in
+the Mac app, and make sure the device can reach the Mac: by inbound IPv6
+(many home routers filter it, and CGNAT rules out IPv4) or through
+Tailscale. Everything, including how to check that your router lets inbound
+IPv6 through and what the design protects against, is in
+[REMOTE_ACCESS.md](REMOTE_ACCESS.md). The Mac receiver app does
+not support remote access.
 
 ### Permissions checklist
 
