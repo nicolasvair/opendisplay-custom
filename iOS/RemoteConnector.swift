@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Security
 
 // MARK: - Remote access: the dialing side (custom build)
 //
@@ -55,7 +56,10 @@ final class RemoteConnector: ObservableObject {
     }
 
     /// Macs paired for remote access (Keychain, RemoteStore).
-    @Published private(set) var hosts: [RemoteHost] = RemoteStore.hosts()
+    @Published private(set) var hosts: [RemoteHost] = []
+    /// The Keychain could not be read or written; shown instead of passing
+    /// a failed read off as "no Mac paired".
+    @Published private(set) var storeError: String?
     /// The Mac `status` is about; nil when there is nothing to show.
     @Published private(set) var activeHostID: String?
     @Published private(set) var status: Status = .idle
@@ -74,13 +78,32 @@ final class RemoteConnector: ObservableObject {
     private var session: NWConnection?       // handed to the receiver
     private var retryWork: DispatchWorkItem?
     private var failures = 0
+    /// Consecutive dial cycles in which some address rejected the TLS
+    /// handshake (the PSK, most likely). One alone may be a transient
+    /// glitch; two in a row stop remote mode.
+    private var refusedCycles = 0
+    /// systemUptime when the current session was adopted.
+    private var sessionStartedAt: TimeInterval = 0
 
     private static let attemptTimeout: TimeInterval = 8
     private static let backoff: [TimeInterval] = [1, 2, 5, 10]
+    /// A session must stay up this long before the backoff starts over;
+    /// otherwise a session that authenticates then drops at once would
+    /// redial every second forever.
+    private static let stableSession: TimeInterval = 30
+    private static let refusedCyclesToGiveUp = 2
+
+    private static let readErrorText = "Impossible de lire les Mac appairés (trousseau) — réessaie plus tard"
 
     init(receiver: StreamReceiver) {
         self.receiver = receiver
         queue = receiver.sessionQueue
+        do {
+            hosts = try RemoteStore.hosts()
+        } catch {
+            Log.info("remote: cannot read the paired Macs: \(error)")
+            storeError = Self.readErrorText
+        }
     }
 
     // MARK: Main-thread API
@@ -102,6 +125,7 @@ final class RemoteConnector: ObservableObject {
             self.target = host
             self.secret = nil
             self.failures = 0
+            self.refusedCycles = 0
             Log.info("remote: connecting to \(host.name)")
             self.dialCycle()
         }
@@ -121,12 +145,24 @@ final class RemoteConnector: ObservableObject {
         }
     }
 
-    /// Removes the Mac from the store and ends anything live with it.
+    /// Removes the Mac from the store and ends anything live with it. If
+    /// the store cannot be read or written, the Mac stays listed and the
+    /// error is shown: nothing is ended for a forget that did not stick.
     func forget(_ host: RemoteHost) {
-        let remaining = RemoteStore.hosts().filter { $0.id != host.id }
+        let all: [RemoteHost]
+        do { all = try RemoteStore.hosts() } catch {
+            Log.info("remote: cannot read the paired Macs to forget \(host.name): \(error)")
+            storeError = Self.readErrorText
+            return
+        }
+        let remaining = all.filter { $0.id != host.id }
         do { try RemoteStore.saveHosts(remaining) } catch {
             Log.info("remote: could not forget \(host.name): \(error)")
+            hosts = all
+            storeError = "Impossible d'oublier « \(host.name) » — réessaie plus tard"
+            return
         }
+        storeError = nil
         hosts = remaining
         queue.async {
             guard self.target?.id == host.id else { return }
@@ -139,9 +175,16 @@ final class RemoteConnector: ObservableObject {
         receiver.dropRemoteSession(hostID: host.id)
     }
 
-    /// The store changed (a pairing completed): reload it.
+    /// The store changed (a pairing completed): reload it. A failed read
+    /// keeps the current list and shows the error.
     func reloadHosts() {
-        let fresh = RemoteStore.hosts()
+        let fresh: [RemoteHost]
+        do { fresh = try RemoteStore.hosts() } catch {
+            Log.info("remote: cannot reload the paired Macs: \(error)")
+            storeError = Self.readErrorText
+            return
+        }
+        storeError = nil
         hosts = fresh
         queue.async {
             guard let target = self.target else { return }
@@ -153,21 +196,31 @@ final class RemoteConnector: ObservableObject {
         }
     }
 
-    /// A Mac sent its current addresses on an authenticated session
-    /// (StreamReceiver, `remoteHost`). Updates a Mac already paired, never
-    /// adds one.
-    func applyHostUpdate(fingerprint: String, addresses: [String], port: UInt16) {
-        guard !addresses.isEmpty else { return }
-        var all = RemoteStore.hosts()
-        guard let index = all.firstIndex(where: { $0.id == fingerprint }),
-              all[index].addresses != addresses || all[index].port != port else { return }
-        all[index].addresses = addresses
-        all[index].port = port
+    /// A Mac sent its current addresses (StreamReceiver, `remoteHost`), on
+    /// whatever session. Applied only to a Mac already paired, and only if
+    /// that Mac's pinned Secure Enclave key verifies the signature; never
+    /// adds a Mac, never empties its address list. Main thread.
+    func applyHostUpdate(_ update: RemoteHostUpdate.Update) {
+        guard !update.addresses.isEmpty else { return }
+        var all: [RemoteHost]
+        do { all = try RemoteStore.hosts() } catch {
+            Log.info("remote: cannot read the paired Macs for an address update: \(error)")
+            return
+        }
+        guard let index = all.firstIndex(where: { $0.id == update.fingerprint }) else { return }
+        guard RemoteHostUpdate.verify(update, against: all[index]) else {
+            Log.info("remote: ignored an address update whose signature does not verify")
+            return
+        }
+        guard all[index].addresses != update.addresses || all[index].port != update.port else { return }
+        all[index].addresses = update.addresses
+        all[index].port = update.port
         do { try RemoteStore.saveHosts(all) } catch {
             Log.info("remote: could not save new addresses: \(error)")
             return
         }
-        Log.info("remote: \(all[index].name) now at \(addresses.count) address(es), port \(port)")
+        Log.info("remote: \(all[index].name) now at \(update.addresses.count) address(es), port \(update.port)")
+        storeError = nil
         hosts = all
         let updated = all[index]
         queue.async {
@@ -194,6 +247,7 @@ final class RemoteConnector: ObservableObject {
             guard self.target != nil, self.session == nil,
                   self.dialing == nil, self.retryWork == nil else { return }
             self.failures = 0
+            self.refusedCycles = 0
             self.dialCycle()
         }
     }
@@ -257,15 +311,21 @@ final class RemoteConnector: ObservableObject {
     }
 
     /// Dial `host.addresses[index]`; on failure, the next one. When none is
-    /// left: refused if some address completed TCP but rejected our PSK,
-    /// else unreachable (retry later).
+    /// left: refused if some address rejected our TLS handshake on this and
+    /// the previous cycle, else unreachable (retry later).
     private func attempt(_ index: Int, generation gen: Int, tlsRefused: Bool) {
         guard gen == generation, let host = target, let secret else { return }
         guard index < host.addresses.count else {
             if tlsRefused {
-                Log.info("remote: \(host.name) rejected our pre-shared key")
-                return giveUp(.refused)
+                refusedCycles += 1
+                if refusedCycles >= Self.refusedCyclesToGiveUp {
+                    Log.info("remote: \(host.name) rejected our pre-shared key \(refusedCycles) times in a row")
+                    return giveUp(.refused)
+                }
+                Log.info("remote: \(host.name) rejected the TLS handshake — retrying once before giving up")
+                return scheduleRetry()
             }
+            refusedCycles = 0
             Log.info("remote: no address of \(host.name) answered")
             return scheduleRetry()
         }
@@ -298,10 +358,11 @@ final class RemoteConnector: ObservableObject {
             switch state {
             case .ready:
                 settled = true
+                self.refusedCycles = 0   // the Mac took our PSK
                 self.authenticate(conn, host: host, generation: gen)
             case .waiting(let error), .failed(let error):
                 Log.info("remote: \(address) failed: \(error)")
-                next(Self.isTLSError(error))
+                next(Self.isHandshakeRejection(error))
             default:
                 break
             }
@@ -364,7 +425,9 @@ final class RemoteConnector: ObservableObject {
             Log.info("remote: \(host.name) authenticated — starting the session")
             conn.stateUpdateHandler = nil   // adoption installs the session's own
             self.session = conn
-            self.failures = 0
+            // failures is reset only once the session proves stable
+            // (sessionEnded), so an auth-then-drop loop keeps backing off.
+            self.sessionStartedAt = ProcessInfo.processInfo.systemUptime
             self.publish(.connected)
             self.receiver.adoptRemote(conn, hostID: host.id) { [weak self] reason in
                 self?.sessionEnded(conn, reason)
@@ -376,6 +439,9 @@ final class RemoteConnector: ObservableObject {
     private func sessionEnded(_ conn: NWConnection, _ reason: StreamReceiver.RemoteSessionEnd) {
         guard session === conn else { return }   // already dropped on purpose
         session = nil
+        if ProcessInfo.processInfo.systemUptime - sessionStartedAt > Self.stableSession {
+            failures = 0
+        }
         switch reason {
         case .superseded:
             Log.info("remote: session replaced by a local one — remote mode off")
@@ -403,8 +469,16 @@ final class RemoteConnector: ObservableObject {
         return .name(text, nil)
     }
 
-    private static func isTLSError(_ error: NWError) -> Bool {
-        if case .tls = error { return true }
-        return false
+    /// A TLS error that means the peer rejected the handshake (wrong PSK,
+    /// unknown identity, alert), as opposed to a connection that merely
+    /// closed or broke mid-handshake, which says nothing about the key.
+    private static func isHandshakeRejection(_ error: NWError) -> Bool {
+        guard case .tls(let status) = error else { return false }
+        let notARejection: [Int] = [
+            Int(errSSLClosedAbort), Int(errSSLClosedGraceful), Int(errSSLClosedNoNotify),
+            Int(errSSLConnectionRefused), Int(errSSLTransportReset), Int(errSSLNetworkTimeout),
+            Int(errSSLWouldBlock),
+        ]
+        return !notARejection.contains(Int(status))
     }
 }

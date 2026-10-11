@@ -118,9 +118,10 @@ final class StreamReceiver: ObservableObject {
         return connection === remoteSession.conn
     }
     #if os(iOS)
-    /// A Mac announced its current remote addresses (`remoteHost`) on an
-    /// authenticated session. Main thread; the app updates its store.
-    var onRemoteHostUpdate: ((_ fingerprint: String, _ addresses: [String], _ port: UInt16) -> Void)?
+    /// A Mac announced its current remote addresses (`remoteHost`), parsed
+    /// but NOT yet verified: the app checks its signature against the key
+    /// pinned for that Mac before using it. Main thread.
+    var onRemoteHostUpdate: ((RemoteHostUpdate.Update) -> Void)?
     #endif
     // What the last hello advertised, to notice a cable appearing
     // mid-session: plugging one creates new interfaces, and a sender can
@@ -849,6 +850,16 @@ final class StreamReceiver: ObservableObject {
                 onEnd(.dropped)
                 return
             }
+            // A live local (USB/WiFi) session wins: adopting would evict it,
+            // and the Mac would redial it and evict us in turn, forever. Tell
+            // the dialer it is superseded so it stops.
+            if let current = self.connection, current !== conn, !self.isRemoteSession,
+               current.state != .cancelled, !Self.isFailed(current.state) {
+                Log.info("remote session not adopted (a local session is live)")
+                conn.cancel()
+                onEnd(.superseded)
+                return
+            }
             Log.info("adopting remote session (Mac \(hostID))")
             self.transport = "Distant"
             self.adopt(conn, remote: RemoteSession(conn: conn, hostID: hostID, onEnd: onEnd))
@@ -872,15 +883,6 @@ final class StreamReceiver: ObservableObject {
             // The send completion may never fire on a dying link.
             self.queue.asyncAfter(deadline: .now() + 1) { conn.cancel() }
         }
-    }
-
-    /// `remoteHost` is honored only from a session that proved who it is:
-    /// remote (signature), TLS-PSK (paired WiFi) or loopback (USB).
-    private var sessionIsAuthenticated: Bool {
-        guard let conn = connection else { return false }
-        if isRemoteSession { return true }
-        if conn.metadata(definition: NWProtocolTLS.definition) != nil { return true }
-        return Self.isLoopback(conn)
     }
     #endif
 
@@ -1115,11 +1117,13 @@ final class StreamReceiver: ObservableObject {
         #if os(iOS)
         case RemoteWire.hostUpdate:
             // Custom: a remote-paired Mac's current addresses (its IPv6
-            // prefix may change). Authenticated sessions only, and a remote
-            // session may only speak for the Mac it authenticated as. The
-            // app updates a Mac it already has; it never adds one from here.
-            guard sessionIsAuthenticated, let update = RemoteHostUpdate.parse(obj) else {
-                Log.info("ignored remoteHost from an unauthenticated session or malformed")
+            // prefix may change). Signed by the Mac's Secure Enclave key: the
+            // app applies it only to the Mac with that fingerprint, and only
+            // if its pinned key verifies the signature, whatever session
+            // carried it. It never adds a Mac from here. A remote session may
+            // in addition only speak for the Mac it authenticated as.
+            guard let update = RemoteHostUpdate.parse(obj) else {
+                Log.info("ignored malformed remoteHost")
                 return
             }
             if isRemoteSession, let remote = remoteSession, remote.hostID != update.fingerprint {
@@ -1127,7 +1131,7 @@ final class StreamReceiver: ObservableObject {
                 return
             }
             DispatchQueue.main.async {
-                self.onRemoteHostUpdate?(update.fingerprint, update.addresses, update.port)
+                self.onRemoteHostUpdate?(update)
             }
         #endif
         default:

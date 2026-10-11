@@ -39,6 +39,11 @@ final class RemotePairingResponder: ObservableObject {
     private var identity: SecureEnclaveIdentity?
     private var deviceName = "Appareil"
     private var ephemeral = Curve25519.KeyAgreement.PrivateKey()
+    /// The Mac's commitment to its hello (rpCommit), received first.
+    private var macCommit: Data?
+    /// Our hello, fixed and sent once the commitment is in, before we see
+    /// the Mac's hello.
+    private var ownHello: RemotePairing.Hello?
     private var macHello: RemotePairing.Hello?
     private var transcript: Data?
     private var secret: Data?
@@ -57,12 +62,11 @@ final class RemotePairingResponder: ObservableObject {
                 return
             }
             self.identity = identity
-            self.deviceName = Self.helloName(deviceName)
+            self.deviceName = RemotePairing.normalizedName(deviceName, role: .device)
             let params = NWParameters(tls: nil, tcp: NWProtocolTCP.Options())
             // The cable only: usbmuxd hands the Mac's dial over on loopback.
             params.requiredInterfaceType = .loopback
             params.includePeerToPeer = false
-            params.allowLocalEndpointReuse = true
             guard let port = NWEndpoint.Port(rawValue: basePort &+ RemoteWire.usbPairingPortOffset),
                   let listener = try? NWListener(using: params, on: port) else {
                 self.publish(.failed("Impossible d'ouvrir le port d'appairage USB"))
@@ -157,17 +161,36 @@ final class RemotePairingResponder: ObservableObject {
         switch type {
         case RemoteWire.pairAbort:
             fail("Appairage annulé sur le Mac")
+        case RemoteWire.pairCommit:
+            // 1. The Mac commits to its hello before it sees ours.
+            guard currentState == .waiting, macCommit == nil, ownHello == nil, macHello == nil,
+                  let identity else {
+                return fail("Message d'appairage inattendu")
+            }
+            guard let commit = RemotePairing.parseCommit(msg) else {
+                return fail("Message d'appairage du Mac invalide")
+            }
+            // 2. Our hello is fixed now, before the Mac reveals its own.
+            ephemeral = Curve25519.KeyAgreement.PrivateKey()
+            let own = RemotePairing.Hello(name: deviceName, signingKey: identity.publicKey,
+                                          ephemeralKey: ephemeral.publicKey.rawRepresentation,
+                                          pskIdentity: nil, installID: StreamReceiver.installID)
+            macCommit = commit
+            ownHello = own
+            channel?.send(RemotePairing.helloMessage(own))
         case RemoteWire.pairHello:
-            guard currentState == .waiting, macHello == nil, let identity else {
+            // 3. The Mac's hello must be exactly the one it committed to.
+            guard currentState == .waiting, macHello == nil,
+                  let commit = macCommit, let own = ownHello else {
                 return fail("Message d'appairage inattendu")
             }
             guard let mac = RemotePairing.parseHello(msg, from: .mac) else {
                 return fail("Message d'appairage du Mac invalide")
             }
-            ephemeral = Curve25519.KeyAgreement.PrivateKey()
-            let own = RemotePairing.Hello(name: deviceName, signingKey: identity.publicKey,
-                                          ephemeralKey: ephemeral.publicKey.rawRepresentation,
-                                          pskIdentity: nil, installID: StreamReceiver.installID)
+            guard RemotePairing.helloDigest(mac, role: .mac) == commit else {
+                Log.info("remote pairing: the Mac's hello does not match its commitment")
+                return fail("Le Mac n'a pas respecté son engagement — appairage refusé")
+            }
             let transcript = RemotePairing.transcript(mac: mac, device: own)
             guard let secret = try? RemotePairing.secret(ownEphemeral: ephemeral,
                                                          peerEphemeral: mac.ephemeralKey,
@@ -177,7 +200,6 @@ final class RemotePairingResponder: ObservableObject {
             macHello = mac
             self.transcript = transcript
             self.secret = secret
-            channel?.send(RemotePairing.helloMessage(own))
             publish(.showCode(code: RemotePairing.code(transcript: transcript), mac: mac.name))
         case RemoteWire.pairConfirm:
             guard let mac = macHello, let transcript, macConfirm == nil, awaitingConfirm else {
@@ -206,10 +228,24 @@ final class RemotePairingResponder: ObservableObject {
     private func complete() {
         guard userAccepted, let identity, let mac = macHello, let pid = mac.pskIdentity,
               let transcript, let secret, let confirm = macConfirm else { return }
+        // A failed read must never pass for "no Mac yet": saving over it
+        // would erase every other pairing.
+        let existing: [RemoteHost]
+        do { existing = try RemoteStore.hosts() } catch {
+            Log.info("remote pairing: could not read the paired Macs: \(error)")
+            return fail("Impossible de lire les Mac déjà appairés — réessaie")
+        }
+        let fingerprint = RemoteCrypto.fingerprint(of: mac.signingKey)
+        // merged() drops any record with the same PSK identity: a Mac reusing
+        // another Mac's identity would erase that Mac's pairing.
+        if existing.contains(where: { $0.pskIdentity == pid && $0.id != fingerprint }) {
+            Log.info("remote pairing: PSK identity already belongs to another paired Mac — refusing")
+            return fail("Identifiant d'appairage déjà utilisé par un autre Mac — appairage refusé")
+        }
         do {
             let reply = try RemotePairing.confirmMessage(.device, transcript: transcript,
                                                          identity: identity)
-            let host = RemoteHost(id: RemoteCrypto.fingerprint(of: mac.signingKey),
+            let host = RemoteHost(id: fingerprint,
                                   name: mac.name,
                                   publicKey: mac.signingKey,
                                   pskIdentity: pid,
@@ -217,7 +253,7 @@ final class RemotePairingResponder: ObservableObject {
                                   addresses: confirm.addresses,
                                   port: confirm.port,
                                   pairedAt: Date())
-            try RemoteStore.saveHosts(RemoteStore.merged(RemoteStore.hosts(), with: host))
+            try RemoteStore.saveHosts(RemoteStore.merged(existing, with: host))
             channel?.send(reply)
         } catch {
             Log.info("remote pairing: could not store the Mac: \(error)")
@@ -233,6 +269,8 @@ final class RemotePairingResponder: ObservableObject {
             finished?.close("done")
             if self.channel === finished { self.channel = nil }
         }
+        macCommit = nil
+        ownHello = nil
         macHello = nil
         self.transcript = nil
         self.secret = nil
@@ -257,6 +295,8 @@ final class RemotePairingResponder: ObservableObject {
         let channel = self.channel
         self.channel = nil
         channel?.close("done")
+        macCommit = nil
+        ownHello = nil
         macHello = nil
         transcript = nil
         secret = nil
@@ -265,13 +305,6 @@ final class RemotePairingResponder: ObservableObject {
     }
 
     // MARK: Sanitizing
-
-    /// The name in our hello exactly as the Mac will parse it (non-empty,
-    /// at most 64 characters), so both transcripts hash the same bytes.
-    private static func helloName(_ name: String) -> String {
-        let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
-        return trimmed.isEmpty ? "Appareil" : trimmed
-    }
 
     /// At most 16 non-empty strings of at most 255 characters; anything else
     /// is dropped.

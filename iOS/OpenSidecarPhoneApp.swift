@@ -406,6 +406,10 @@ struct SettingsView: View {
                               systemImage: "lock.slash")
                             .foregroundStyle(.secondary)
                     } else {
+                        if let error = remote.storeError {
+                            Label(error, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                        }
                         ForEach(remote.hosts) { host in
                             RemoteHostRow(host: host, remote: remote)
                         }
@@ -640,9 +644,10 @@ final class ReceiverModel: ObservableObject {
         }
         let savedName = UserDefaults.standard.string(forKey: "deviceName")
         receiver.serviceName = (savedName?.isEmpty == false) ? savedName! : UIDevice.current.name
-        // A Mac's new remote addresses, from any authenticated session.
-        receiver.onRemoteHostUpdate = { [weak remote = self.remote] fingerprint, addresses, port in
-            remote?.applyHostUpdate(fingerprint: fingerprint, addresses: addresses, port: port)
+        // A Mac's new remote addresses, from any session; the connector
+        // checks the Mac's signature before using them.
+        receiver.onRemoteHostUpdate = { [weak remote = self.remote] update in
+            remote?.applyHostUpdate(update)
         }
         receiver.objectWillChange
             .receive(on: DispatchQueue.main)
