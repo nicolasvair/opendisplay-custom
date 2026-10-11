@@ -104,7 +104,8 @@ struct ReceiverScreen: View {
                         .allowsHitTesting(false)   // never block touch input
                     }
                 } else {
-                    IdleView(receiver: model.receiver, showSettings: $showSettings)
+                    IdleView(receiver: model.receiver, remote: model.remote,
+                             showSettings: $showSettings)
                 }
             }
             .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
@@ -119,7 +120,7 @@ struct ReceiverScreen: View {
         .statusBarHidden(isStreaming)
         .systemOverlaysHidden(isStreaming)
         .sheet(isPresented: $showSettings) {
-            SettingsView(receiver: model.receiver)
+            SettingsView(receiver: model.receiver, remote: model.remote)
         }
         // Below the force floor → blocking gate. Setter is a no-op: the user
         // cannot dismiss it, only update.
@@ -199,6 +200,7 @@ struct ReceiverScreen: View {
 
 struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
+    @ObservedObject var remote: RemoteConnector
     @Binding var showSettings: Bool
 
     var body: some View {
@@ -220,6 +222,13 @@ struct IdleView: View {
                     Text(receiver.status)
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                }
+                // Remote access in progress (or stopped with a reason).
+                if let host = remote.activeHost, remote.status != .idle {
+                    Label("\(host.name) à distance : \(remote.status.text)", systemImage: "network")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
                 }
             }
 
@@ -329,7 +338,9 @@ struct OnboardingView: View {
 
 struct SettingsView: View {
     @ObservedObject var receiver: StreamReceiver
+    @ObservedObject var remote: RemoteConnector
     @StateObject private var pairing = PairingResponder()
+    @StateObject private var remotePairing = RemotePairingResponder()
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
@@ -388,6 +399,30 @@ struct SettingsView: View {
                          : "WiFi chiffré : seuls les Mac appairés peuvent se connecter sans câble. L'USB reste ouvert.")
                 }
                 .onAppear { pairing.onPairingsChanged = { [weak receiver] in receiver?.pairingsDidChange() } }
+
+                Section {
+                    if SecureEnclaveIdentity.shared == nil {
+                        Label("Indisponible : cet appareil n'a pas de Secure Enclave utilisable.",
+                              systemImage: "lock.slash")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(remote.hosts) { host in
+                            RemoteHostRow(host: host, remote: remote)
+                        }
+                        NavigationLink {
+                            RemotePairingView(responder: remotePairing,
+                                              deviceName: receiver.currentServiceName)
+                                .navigationTitle("Appairage USB")
+                        } label: {
+                            Label("Autoriser l'appairage USB", systemImage: "cable.connector")
+                        }
+                    }
+                } header: {
+                    Text("Accès à distance")
+                } footer: {
+                    Text("L'accès à distance s'appaire uniquement par le câble USB : branche ce \(deviceKind) au Mac, puis lance l'appairage sur les deux appareils. Ensuite ce \(deviceKind) se connecte au Mac depuis n'importe quel réseau. Depuis l'extérieur, la box du Mac doit autoriser les connexions IPv6 entrantes vers son port (ou utilise Tailscale sur les deux appareils).")
+                }
+                .onAppear { remotePairing.onPaired = { [weak remote] in remote?.reloadHosts() } }
 
                 Section {
                     Toggle("Performance overlay", isOn: $showAnalytics)
@@ -460,7 +495,52 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            // A remote session just came up: get out of the way so the
+            // stream shows, as it does when a local Mac connects.
+            .onChange(of: remote.status) { status in
+                if status == .connected { dismiss() }
+            }
         }
+    }
+}
+
+/// One Mac paired for remote access: connect/disconnect, status, forget.
+private struct RemoteHostRow: View {
+    let host: RemoteHost
+    @ObservedObject var remote: RemoteConnector
+
+    private var isShown: Bool { remote.activeHostID == host.id }
+
+    private var detail: String {
+        if isShown, remote.status != .idle { return remote.status.text }
+        if host.addresses.isEmpty {
+            return "Aucune adresse connue — connecte le Mac en USB ou en WiFi pour la recevoir"
+        }
+        return "\(host.addresses.count) adresse(s), port \(host.port)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label(host.name, systemImage: "network")
+                Spacer()
+                if isShown && remote.status.isEngaged {
+                    Button("Déconnecter") { remote.disconnect() }
+                        .buttonStyle(.borderless)
+                } else {
+                    Button("Se connecter à distance") { remote.connect(host) }
+                        .buttonStyle(.borderless)
+                        .disabled(host.addresses.isEmpty)
+                }
+            }
+            Text(detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Button("Oublier", role: .destructive) { remote.forget(host) }
+                .buttonStyle(.borderless)
+                .font(.footnote)
+        }
+        .padding(.vertical, 2)
     }
 }
 
@@ -536,6 +616,8 @@ private struct DeviceNameField: View {
 @MainActor
 final class ReceiverModel: ObservableObject {
     let receiver: StreamReceiver
+    /// Remote access: dials a Mac paired over USB (iOS/RemoteConnector.swift).
+    let remote: RemoteConnector
     private var started = false
     private var cancellables = Set<AnyCancellable>()
 
@@ -543,6 +625,7 @@ final class ReceiverModel: ObservableObject {
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
                                   fallbackServiceName: UIDevice.current.name)
+        remote = RemoteConnector(receiver: receiver)
         // The control bar, keyboard and trackpad are local (custom build).
         receiver.localControls = true
         receiver.reservedBottomPoints = Double(LocalControls.barHeight)
@@ -557,6 +640,10 @@ final class ReceiverModel: ObservableObject {
         }
         let savedName = UserDefaults.standard.string(forKey: "deviceName")
         receiver.serviceName = (savedName?.isEmpty == false) ? savedName! : UIDevice.current.name
+        // A Mac's new remote addresses, from any authenticated session.
+        receiver.onRemoteHostUpdate = { [weak remote = self.remote] fingerprint, addresses, port in
+            remote?.applyHostUpdate(fingerprint: fingerprint, addresses: addresses, port: port)
+        }
         receiver.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -583,6 +670,8 @@ final class ReceiverModel: ObservableObject {
     private var backgroundToken: UIBackgroundTaskIdentifier = .invalid
 
     func sceneDidBackground() {
+        // No remote dialing off-screen; a live session lingers like a local one.
+        remote.suspend()
         // Known limitation: lock detection rides the protected-data signal,
         // which only fires when a passcode is set AND "Require Passcode" is
         // Immediately (the Face ID default). Other configurations make a
@@ -603,6 +692,7 @@ final class ReceiverModel: ObservableObject {
         endBackgroundAssertion()
         receiver.setRenderingPaused(false)
         receiver.ensureListening()
+        remote.resume()
     }
 
     func deviceWillLock() {
@@ -627,10 +717,12 @@ final class ReceiverModel: ObservableObject {
     /// Mac end the session immediately instead of after its silence grace.
     func appWillTerminate() {
         Log.info("app terminating — closing session")
+        remote.suspend()
         receiver.shutDown()
     }
 
     private func goToSleep() {
+        remote.suspend()   // before the close, so it does not read as a drop
         receiver.enterSleep { [weak self] in
             DispatchQueue.main.async { self?.endBackgroundAssertion() }
         }

@@ -293,17 +293,24 @@ enum RemotePairing {
               let ek = (msg["ek"] as? String).flatMap({ Data(base64Encoded: $0) }),
               (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ek)) != nil
         else { return nil }
-        let name = String(((msg["name"] as? String) ?? "").prefix(64))
+        let name = normalizedName(msg["name"] as? String ?? "", role: role)
         switch role {
         case .mac:
             guard let pid = msg["pid"] as? String, isValidPSKIdentity(pid) else { return nil }
-            return Hello(name: name.isEmpty ? "Mac" : name, signingKey: sk, ephemeralKey: ek,
-                         pskIdentity: pid, installID: nil)
+            return Hello(name: name, signingKey: sk, ephemeralKey: ek, pskIdentity: pid, installID: nil)
         case .device:
             let iid = (msg["iid"] as? String).map { String($0.prefix(64)) }
-            return Hello(name: name.isEmpty ? "Appareil" : name, signingKey: sk, ephemeralKey: ek,
-                         pskIdentity: nil, installID: iid)
+            return Hello(name: name, signingKey: sk, ephemeralKey: ek, pskIdentity: nil, installID: iid)
         }
+    }
+
+    /// Display names as both sides hash them: trimmed, at most 64
+    /// characters, never empty. `transcript` applies it too, so the sender's
+    /// own `Hello` and the peer's parsed copy always hash alike.
+    static func normalizedName(_ name: String, role: RemoteRole) -> String {
+        let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        if !trimmed.isEmpty { return trimmed }
+        return role == .mac ? "Mac" : "Appareil"
     }
 
     /// A fresh PSK identity: 16 random bytes, hex.
@@ -319,8 +326,9 @@ enum RemotePairing {
     static func transcript(mac: Hello, device: Hello) -> Data {
         var input = Data("opendisplay-remote-pair-v1".utf8)
         let fields: [Data] = [
-            mac.signingKey, mac.ephemeralKey, Data(mac.name.utf8), Data((mac.pskIdentity ?? "").utf8),
-            device.signingKey, device.ephemeralKey, Data(device.name.utf8),
+            mac.signingKey, mac.ephemeralKey, Data(normalizedName(mac.name, role: .mac).utf8),
+            Data((mac.pskIdentity ?? "").utf8),
+            device.signingKey, device.ephemeralKey, Data(normalizedName(device.name, role: .device).utf8),
             Data((device.installID ?? "").utf8),
         ]
         for field in fields {
@@ -492,7 +500,9 @@ enum RemoteHostUpdate {
               let addrs = msg["addrs"] as? [String],
               let port = msg["port"] as? Int, port > 0, port <= Int(UInt16.max)
         else { return nil }
-        let clean = addrs.prefix(16).map { String($0.prefix(255)) }.filter { !$0.isEmpty }
+        let clean = addrs.prefix(16)
+            .map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(255)) }
+            .filter { !$0.isEmpty }
         return (fp, Array(clean), UInt16(port))
     }
 }

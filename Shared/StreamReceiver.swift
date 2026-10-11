@@ -102,6 +102,26 @@ final class StreamReceiver: ObservableObject {
     // an untracked silent socket would sit parked forever and could even
     // adopt into a receiver that was stopped in the meantime.
     private var pendingConnections: [NWConnection] = []
+    // Remote access (Shared/RemoteTrust.swift, iOS only): a session this
+    // device dialed out and authenticated itself (RemoteConnector), adopted
+    // like a listener's. Its dialer hears when it ends so it can redial.
+    // Invariant: nil, or its `conn` is `connection`.
+    enum RemoteSessionEnd { case dropped, superseded, closed }
+    private struct RemoteSession {
+        let conn: NWConnection
+        let hostID: String
+        let onEnd: (RemoteSessionEnd) -> Void
+    }
+    private var remoteSession: RemoteSession?
+    private var isRemoteSession: Bool {
+        guard let connection, let remoteSession else { return false }
+        return connection === remoteSession.conn
+    }
+    #if os(iOS)
+    /// A Mac announced its current remote addresses (`remoteHost`) on an
+    /// authenticated session. Main thread; the app updates its store.
+    var onRemoteHostUpdate: ((_ fingerprint: String, _ addresses: [String], _ port: UInt16) -> Void)?
+    #endif
     // What the last hello advertised, to notice a cable appearing
     // mid-session: plugging one creates new interfaces, and a sender can
     // only probe addresses it has been told about.
@@ -461,6 +481,9 @@ final class StreamReceiver: ObservableObject {
             let finish = { [weak self] in
                 guard let self, !finished else { return }
                 finished = true
+                // Deliberate close: a remote dialer waits for the app to
+                // come back instead of redialing into a sleeping receiver.
+                if let conn = self.connection { self.endRemoteSession(conn, .closed) }
                 self.connection?.cancel()
                 self.connection = nil
                 self.listener?.cancel()
@@ -735,10 +758,9 @@ final class StreamReceiver: ObservableObject {
     private func accept(_ conn: NWConnection) {
         Log.info("new connection from \(String(describing: conn.endpoint))")
         // usbmux-forwarded (cable) connections arrive from loopback;
-        // anything else came over the network.
-        let peer = String(describing: conn.endpoint)
-        self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
-                          || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
+        // anything else came over the network. Applied on adoption: a
+        // candidate must not relabel the live session (it may be remote).
+        let label = Self.isLoopback(conn) ? "USB" : "WiFi"
         // A Bonjour dial races IPv6 and IPv4 and both handshakes can
         // complete; the sender cancels its loser within milliseconds.
         // Adopting every newcomer at once evicted the winner for a
@@ -772,6 +794,7 @@ final class StreamReceiver: ObservableObject {
                     }
                     self.pendingConnections.removeAll { $0 === conn }
                     if let data, !data.isEmpty {
+                        self.transport = label
                         self.adopt(conn, greeted: true, initialData: data)
                     } else {
                         Log.info("ignored a twin connection that closed at once"
@@ -783,13 +806,91 @@ final class StreamReceiver: ObservableObject {
             }
             conn.start(queue: self.queue)
         } else {
+            self.transport = label
             self.adopt(conn)
         }
     }
 
     private static func isLoopback(_ conn: NWConnection) -> Bool {
-        let peer = String(describing: conn.endpoint)
-        return peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1") || peer.hasPrefix("localhost")
+        isLoopback(conn.endpoint)
+    }
+
+    /// True when `endpoint` is a loopback IP (127/8, ::1, IPv4-mapped 127/8).
+    /// Decided on the parsed address, never on its printed form. Names
+    /// (even "localhost") do not count: inbound peers are always addresses.
+    static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        switch host {
+        case .ipv4(let address):
+            return address.isLoopback
+        case .ipv6(let address):
+            return address.isLoopback || (address.asIPv4?.isLoopback ?? false)
+        default:
+            return false
+        }
+    }
+
+    #if os(iOS)
+    /// The queue every session callback runs on. A remote dialer starts its
+    /// connection here, so the connection can be adopted as it is.
+    var sessionQueue: DispatchQueue { queue }
+
+    /// Make an outgoing remote connection the session. The caller has
+    /// already authenticated it (RemoteConnector): it must have been started
+    /// on `sessionQueue` and be ready, with nothing read past the Mac's auth
+    /// frame. hello goes out at once. `onEnd` runs once, on `sessionQueue`,
+    /// when this session ends (or right away if it cannot be adopted).
+    func adoptRemote(_ conn: NWConnection, hostID: String,
+                     onEnd: @escaping (RemoteSessionEnd) -> Void) {
+        queue.async {
+            guard self.wantsListener, !self.closePending, conn.state == .ready else {
+                Log.info("remote session not adopted (receiver closing or connection gone)")
+                conn.cancel()
+                onEnd(.dropped)
+                return
+            }
+            Log.info("adopting remote session (Mac \(hostID))")
+            self.transport = "Distant"
+            self.adopt(conn, remote: RemoteSession(conn: conn, hostID: hostID, onEnd: onEnd))
+        }
+    }
+
+    /// End the remote session on the user's request: announce "closing" so
+    /// the Mac ends it at once, then drop it. No-op unless the live session
+    /// is remote (and, with `hostID`, for that Mac).
+    func dropRemoteSession(hostID: String? = nil) {
+        queue.async {
+            guard let remote = self.remoteSession,
+                  hostID == nil || remote.hostID == hostID else { return }
+            let conn = remote.conn
+            self.endRemoteSession(conn, .closed)
+            guard conn === self.connection else { conn.cancel(); return }
+            Log.info("dropping remote session (user)")
+            self.connection = nil
+            self.setConnected(false)
+            self.sendControl(["type": WireMessage.closing], on: conn) { conn.cancel() }
+            // The send completion may never fire on a dying link.
+            self.queue.asyncAfter(deadline: .now() + 1) { conn.cancel() }
+        }
+    }
+
+    /// `remoteHost` is honored only from a session that proved who it is:
+    /// remote (signature), TLS-PSK (paired WiFi) or loopback (USB).
+    private var sessionIsAuthenticated: Bool {
+        guard let conn = connection else { return false }
+        if isRemoteSession { return true }
+        if conn.metadata(definition: NWProtocolTLS.definition) != nil { return true }
+        return Self.isLoopback(conn)
+    }
+    #endif
+
+    /// Tell a remote session's dialer it ended, once. No-op for any other
+    /// connection.
+    private func endRemoteSession(_ conn: NWConnection, _ reason: RemoteSessionEnd) {
+        guard let remote = remoteSession, remote.conn === conn else { return }
+        remoteSession = nil
+        Log.info("remote session ended (\(reason))")
+        remote.onEnd(reason)
     }
 
     /// Make `conn` the session: replace any existing connection and reset
@@ -797,8 +898,15 @@ final class StreamReceiver: ObservableObject {
     /// without the cursor port while it proved itself (see the listener), with
     /// the bytes it sent back in `initialData`. Once adopted, the full hello
     /// opens a cursor flow that unambiguously belongs to this session.
-    private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
+    private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil,
+                       remote: RemoteSession? = nil) {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
+        // Another session takes over from a remote one: its dialer stops
+        // rather than fight the newcomer for the receiver.
+        if let previous = remoteSession, previous.conn !== conn {
+            endRemoteSession(previous.conn, .superseded)
+        }
+        remoteSession = remote   // before hello: remote sessions get no cursor port
         connection?.cancel()
         connection = conn
         // The race is decided: rival candidates die here.
@@ -830,7 +938,14 @@ final class StreamReceiver: ObservableObject {
             self.sendHello(on: conn)
         }
         conn.stateUpdateHandler = { [weak self] state in
-            guard let self, conn === self.connection else { return }   // replaced: stay quiet
+            guard let self else { return }
+            // Every drop (receive error, EOF, watchdog, replacement) cancels
+            // the socket, so this is where a remote dialer hears of it.
+            switch state {
+            case .failed, .cancelled: self.endRemoteSession(conn, .dropped)
+            default: break
+            }
+            guard conn === self.connection else { return }   // replaced: stay quiet
             switch state {
             case .ready: onReady()
             case .failed, .cancelled: self.setConnected(false)
@@ -890,9 +1005,12 @@ final class StreamReceiver: ObservableObject {
         let watchdog = DispatchSource.makeTimerSource(queue: queue)
         watchdog.schedule(deadline: .now() + 2.0, repeating: 2.0)
         watchdog.setEventHandler { [weak self] in
-            guard let self, let conn = self.connection, conn.state == .ready,
-                  Date().timeIntervalSince(self.lastDataReceived) > 5 else { return }
-            Log.info("watchdog: nothing from the Mac for >5s — dropping connection")
+            guard let self, let conn = self.connection, conn.state == .ready else { return }
+            // A remote path (cellular, far-away Mac) has much longer gaps
+            // than a cable or a LAN; dropping it at 5 s would churn redials.
+            let limit: TimeInterval = self.isRemoteSession ? 15 : 5
+            guard Date().timeIntervalSince(self.lastDataReceived) > limit else { return }
+            Log.info("watchdog: nothing from the Mac for >\(Int(limit))s — dropping connection")
             conn.cancel()
             self.connection = nil
             self.setConnected(false)
@@ -994,6 +1112,24 @@ final class StreamReceiver: ObservableObject {
                 ?? "Update OpenDisplay from the App Store to keep using your second display."
             let store = (obj["store"] as? String).flatMap { URL(string: $0) } ?? AppStore.updateURL
             DispatchQueue.main.async { self.peerSignal = .updateReceiver(message: message, storeURL: store) }
+        #if os(iOS)
+        case RemoteWire.hostUpdate:
+            // Custom: a remote-paired Mac's current addresses (its IPv6
+            // prefix may change). Authenticated sessions only, and a remote
+            // session may only speak for the Mac it authenticated as. The
+            // app updates a Mac it already has; it never adds one from here.
+            guard sessionIsAuthenticated, let update = RemoteHostUpdate.parse(obj) else {
+                Log.info("ignored remoteHost from an unauthenticated session or malformed")
+                return
+            }
+            if isRemoteSession, let remote = remoteSession, remote.hostID != update.fingerprint {
+                Log.info("ignored remoteHost for another Mac on a remote session")
+                return
+            }
+            DispatchQueue.main.async {
+                self.onRemoteHostUpdate?(update.fingerprint, update.addresses, update.port)
+            }
+        #endif
         default:
             break
         }
@@ -1112,7 +1248,9 @@ final class StreamReceiver: ObservableObject {
         hello["videoCaps"] = [h264]
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
-        let announcesCursorPort = includeCursorPort && cursorListenerReady
+        // Never on a remote session: the UDP channel is unauthenticated.
+        let isRemote = remoteSession.map { $0.conn === conn } ?? false
+        let announcesCursorPort = includeCursorPort && cursorListenerReady && !isRemote
         if announcesCursorPort { hello["cursorPort"] = Int(cursorPort) }
         // Additive: decode ceiling (PROTOCOL.md 6.5) — ask for the full
         // desktop but a stream no larger than this machine can decode.
