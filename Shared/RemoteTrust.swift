@@ -52,6 +52,7 @@ enum RemoteWire {
     static let version = 1
 
     // Pairing dialogue message types (newline-delimited JSON, PairingChannel).
+    static let pairCommit = "rpCommit"
     static let pairHello = "rpHello"
     static let pairConfirm = "rpConfirm"
     static let pairAbort = "rpAbort"
@@ -124,8 +125,11 @@ final class SecureEnclaveIdentity: RemoteIdentity {
         let access = SecAccessControlCreateWithFlags(
             nil, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, .privateKeyUsage, nil)!
         let signing: SecureEnclave.P256.Signing.PrivateKey
+        // A handle copied from another machine (migration, backup) may load
+        // but cannot sign; probe it and start over with a fresh key if so.
         if let blob = KeychainBlob.load(service: keychainService, account: "signing"),
-           let key = try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: blob) {
+           let key = try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: blob),
+           (try? key.signature(for: Data("probe".utf8))) != nil {
             signing = key
         } else {
             signing = try SecureEnclave.P256.Signing.PrivateKey(accessControl: access)
@@ -133,7 +137,8 @@ final class SecureEnclaveIdentity: RemoteIdentity {
         }
         let agreement: SecureEnclave.P256.KeyAgreement.PrivateKey
         if let blob = KeychainBlob.load(service: keychainService, account: "agreement"),
-           let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) {
+           let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob),
+           (try? key.sharedSecretFromKeyAgreement(with: P256.KeyAgreement.PrivateKey().publicKey)) != nil {
             agreement = key
         } else {
             agreement = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access)
@@ -247,8 +252,9 @@ enum RemoteCrypto {
 /// devices are talking. Both screens show a code derived from the whole
 /// exchange, and the user accepts on both devices.
 ///
-///     Mac    -> device  rpHello   {v, name, sk, ek, pid}
+///     Mac    -> device  rpCommit  {v, c: helloDigest(mac hello)}
 ///     device -> Mac     rpHello   {v, name, sk, ek, iid}
+///     Mac    -> device  rpHello   {v, name, sk, ek, pid}   (device checks it against c)
 ///     (both show code(transcript), the user accepts on each device)
 ///     Mac    -> device  rpConfirm {sig: sign_mac(confirm(.mac, T)), addrs, port}
 ///     device -> Mac     rpConfirm {sig: sign_dev(confirm(.device, T))}
@@ -257,6 +263,11 @@ enum RemoteCrypto {
 /// for this pairing only, `pid` the TLS-PSK identity the Mac assigns (random,
 /// so it reveals nothing about either device), `iid` the device's install ID
 /// (so the Mac can recognize the device when it later arrives over USB or WiFi).
+/// The Mac commits to its hello before it sees the device's, and the device
+/// sends its hello before it sees the Mac's. Neither side (nor a man in the
+/// middle playing either role) can then try hello variants until the
+/// 6-digit codes on the two screens match: the code is fixed before the
+/// last party to speak learns what it will be.
 /// Each side stores the peer only after both of these hold: its own user
 /// accepted, and the peer's confirm signature checks out against the `sk`
 /// from the transcript.
@@ -284,6 +295,31 @@ enum RemotePairing {
         return msg
     }
 
+    /// The Mac's commitment: a digest of its whole hello, sent before it sees
+    /// the device's hello.
+    static func helloDigest(_ hello: Hello, role: RemoteRole) -> Data {
+        var input = Data("opendisplay-remote-commit-v1\0\(role.rawValue)".utf8)
+        let fields: [Data] = [
+            hello.signingKey, hello.ephemeralKey, Data(normalizedName(hello.name, role: role).utf8),
+            Data((hello.pskIdentity ?? "").utf8), Data((hello.installID ?? "").utf8),
+        ]
+        for field in fields { appendLengthPrefixed(field, to: &input) }
+        return Data(SHA256.hash(data: input))
+    }
+
+    static func commitMessage(_ hello: Hello) -> [String: Any] {
+        ["type": RemoteWire.pairCommit, "v": RemoteWire.version,
+         "c": helloDigest(hello, role: .mac).base64EncodedString()]
+    }
+
+    static func parseCommit(_ msg: [String: Any]) -> Data? {
+        guard msg["type"] as? String == RemoteWire.pairCommit,
+              msg["v"] as? Int == RemoteWire.version,
+              let c = (msg["c"] as? String).flatMap({ Data(base64Encoded: $0) }), c.count == 32
+        else { return nil }
+        return c
+    }
+
     /// Validates a peer's hello. `from` is the role of the peer that sent it.
     static func parseHello(_ msg: [String: Any], from role: RemoteRole) -> Hello? {
         guard msg["type"] as? String == RemoteWire.pairHello,
@@ -308,7 +344,12 @@ enum RemotePairing {
     /// characters, never empty. `transcript` applies it too, so the sender's
     /// own `Hello` and the peer's parsed copy always hash alike.
     static func normalizedName(_ name: String, role: RemoteRole) -> String {
-        let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        // Control and format characters (bidi overrides included) could make
+        // a name display as something else on the confirmation screens.
+        let visible = String(name.unicodeScalars.filter {
+            $0.properties.generalCategory != .control && $0.properties.generalCategory != .format
+        })
+        let trimmed = String(visible.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
         if !trimmed.isEmpty { return trimmed }
         return role == .mac ? "Mac" : "Appareil"
     }
@@ -331,12 +372,14 @@ enum RemotePairing {
             device.signingKey, device.ephemeralKey, Data(normalizedName(device.name, role: .device).utf8),
             Data((device.installID ?? "").utf8),
         ]
-        for field in fields {
-            var length = UInt32(field.count).bigEndian
-            input.append(Data(bytes: &length, count: 4))
-            input.append(field)
-        }
+        for field in fields { appendLengthPrefixed(field, to: &input) }
         return Data(SHA256.hash(data: input))
+    }
+
+    static func appendLengthPrefixed(_ field: Data, to input: inout Data) {
+        var length = UInt32(field.count).bigEndian
+        input.append(Data(bytes: &length, count: 4))
+        input.append(field)
     }
 
     /// The 6-digit code both screens show.
@@ -489,21 +532,47 @@ enum RemoteAuth {
 // MARK: - Address updates
 
 enum RemoteHostUpdate {
-    /// Mac -> device: `{"type":"remoteHost","fp":<mac fingerprint>,"addrs":[...],"port":n}`.
-    static func message(macFingerprint: String, addresses: [String], port: UInt16) -> [String: Any] {
-        ["type": RemoteWire.hostUpdate, "fp": macFingerprint, "addrs": addresses, "port": Int(port)]
+    /// Mac -> device: `{"type":"remoteHost","fp","addrs","port","sig"}`. The
+    /// Mac signs it with its Secure Enclave key, so a device accepts it only
+    /// for the Mac whose pinned key verifies it, whatever session carried it.
+    static func message(identity: RemoteIdentity, addresses: [String], port: UInt16) throws -> [String: Any] {
+        let fp = identity.fingerprint
+        let sig = try identity.sign(payload(fingerprint: fp, addresses: addresses, port: port))
+        return ["type": RemoteWire.hostUpdate, "fp": fp, "addrs": addresses, "port": Int(port),
+                "sig": sig.base64EncodedString()]
     }
 
-    static func parse(_ msg: [String: Any]) -> (fingerprint: String, addresses: [String], port: UInt16)? {
+    static func payload(fingerprint: String, addresses: [String], port: UInt16) -> Data {
+        var input = Data("opendisplay-remote-host-v1\0\(fingerprint)\0\(port)".utf8)
+        for address in addresses { RemotePairing.appendLengthPrefixed(Data(address.utf8), to: &input) }
+        return input
+    }
+
+    struct Update: Equatable {
+        var fingerprint: String
+        var addresses: [String]
+        var port: UInt16
+        var signature: Data
+    }
+
+    /// Shape checks only; call `verify` against the stored host before use.
+    static func parse(_ msg: [String: Any]) -> Update? {
         guard msg["type"] as? String == RemoteWire.hostUpdate,
               let fp = msg["fp"] as? String, fp.count == 32,
-              let addrs = msg["addrs"] as? [String],
-              let port = msg["port"] as? Int, port > 0, port <= Int(UInt16.max)
+              let addrs = msg["addrs"] as? [String], addrs.count <= 16,
+              let port = msg["port"] as? Int, port > 0, port <= Int(UInt16.max),
+              let sig = (msg["sig"] as? String).flatMap({ Data(base64Encoded: $0) })
         else { return nil }
-        let clean = addrs.prefix(16)
-            .map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(255)) }
-            .filter { !$0.isEmpty }
-        return (fp, Array(clean), UInt16(port))
+        guard addrs.allSatisfy({ !$0.isEmpty && $0.count <= 255 }) else { return nil }
+        return Update(fingerprint: fp, addresses: addrs, port: UInt16(port), signature: sig)
+    }
+
+    static func verify(_ update: Update, against host: RemoteHost) -> Bool {
+        update.fingerprint == host.id
+            && RemoteCrypto.verify(signature: update.signature,
+                                   message: payload(fingerprint: update.fingerprint,
+                                                    addresses: update.addresses, port: update.port),
+                                   publicKey: host.publicKey)
     }
 }
 
@@ -566,7 +635,9 @@ enum RemoteStore {
 
     private static func save<T: Codable>(_ records: [T], account: String) throws {
         if records.isEmpty {
-            KeychainBlob.delete(service: service, account: account)
+            guard KeychainBlob.delete(service: service, account: account) else {
+                throw RemoteTrustError.keychain(errSecIO)
+            }
             return
         }
         try KeychainBlob.save(try JSONEncoder().encode(records), service: service, account: account)
@@ -588,7 +659,9 @@ enum KeychainBlob {
         let query = baseQuery(service, account)
         let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecSuccess { return }
-        guard status == errSecItemNotFound else { throw RemoteTrustError.keychain(status) }
+        // An item that cannot be updated in place (ACL, legacy keychain
+        // quirks) is replaced, so a "forget" can never silently not stick.
+        if status != errSecItemNotFound { SecItemDelete(query as CFDictionary) }
         var add = query
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
@@ -596,8 +669,10 @@ enum KeychainBlob {
         guard addStatus == errSecSuccess else { throw RemoteTrustError.keychain(addStatus) }
     }
 
-    static func delete(service: String, account: String) {
-        SecItemDelete(baseQuery(service, account) as CFDictionary)
+    @discardableResult
+    static func delete(service: String, account: String) -> Bool {
+        let status = SecItemDelete(baseQuery(service, account) as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 
     private static func baseQuery(_ service: String, _ account: String) -> [String: Any] {

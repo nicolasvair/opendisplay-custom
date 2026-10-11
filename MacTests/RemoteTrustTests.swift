@@ -181,16 +181,47 @@ final class RemoteTrustTests: XCTestCase {
         XCTAssertEqual(RemoteStore.merged([a, b], with: clash), [a, clash])
     }
 
-    func testHostUpdateParsing() throws {
-        let fp = SoftwareIdentity().fingerprint
-        let msg = try roundTrip(RemoteHostUpdate.message(macFingerprint: fp,
+    func testHostUpdateVerifiesOnlyForTheSigningMac() throws {
+        let mac = SoftwareIdentity(), other = SoftwareIdentity()
+        func host(_ identity: SoftwareIdentity) -> RemoteHost {
+            RemoteHost(id: identity.fingerprint, name: "Mac", publicKey: identity.publicKey,
+                       pskIdentity: RemotePairing.newPSKIdentity(), sealedSecret: Data(),
+                       addresses: [], port: 9010, pairedAt: Date())
+        }
+        let msg = try roundTrip(RemoteHostUpdate.message(identity: mac,
                                                          addresses: ["2a01:db8::1", "mac.example.net"],
-                                                         port: 9010))
-        let parsed = try XCTUnwrap(RemoteHostUpdate.parse(msg))
-        XCTAssertEqual(parsed.fingerprint, fp)
-        XCTAssertEqual(parsed.addresses, ["2a01:db8::1", "mac.example.net"])
-        XCTAssertEqual(parsed.port, 9010)
-        XCTAssertNil(RemoteHostUpdate.parse(["type": "remoteHost", "fp": fp, "addrs": [], "port": 0]))
+                                                         port: 9011))
+        let update = try XCTUnwrap(RemoteHostUpdate.parse(msg))
+        XCTAssertEqual(update.fingerprint, mac.fingerprint)
+        XCTAssertEqual(update.addresses, ["2a01:db8::1", "mac.example.net"])
+        XCTAssertEqual(update.port, 9011)
+        XCTAssertTrue(RemoteHostUpdate.verify(update, against: host(mac)))
+        XCTAssertFalse(RemoteHostUpdate.verify(update, against: host(other)))
+        var redirected = update
+        redirected.addresses = ["attacker.example"]
+        XCTAssertFalse(RemoteHostUpdate.verify(redirected, against: host(mac)))
+        var unsigned = msg
+        unsigned["sig"] = nil
+        XCTAssertNil(RemoteHostUpdate.parse(unsigned))
+    }
+
+    func testCommitBindsTheMacHello() throws {
+        let (macHello, _) = hellos(mac: Side(), device: Side())
+        let commit = try XCTUnwrap(RemotePairing.parseCommit(try roundTrip(RemotePairing.commitMessage(macHello))))
+        let revealed = try XCTUnwrap(RemotePairing.parseHello(try roundTrip(RemotePairing.helloMessage(macHello)),
+                                                              from: .mac))
+        XCTAssertEqual(RemotePairing.helloDigest(revealed, role: .mac), commit)
+        var changed = revealed
+        changed.ephemeralKey = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+        XCTAssertNotEqual(RemotePairing.helloDigest(changed, role: .mac), commit)
+        changed = revealed
+        changed.name = "Other"
+        XCTAssertNotEqual(RemotePairing.helloDigest(changed, role: .mac), commit)
+    }
+
+    func testNamesDropControlAndFormatCharacters() {
+        XCTAssertEqual(RemotePairing.normalizedName("  iPad\u{202E}de Paul\n ", role: .device), "iPadde Paul")
+        XCTAssertEqual(RemotePairing.normalizedName("\u{200F}\u{0007}", role: .mac), "Mac")
     }
 
     // MARK: Helpers
