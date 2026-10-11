@@ -57,6 +57,11 @@ struct PhoneInfo: Decodable {
 enum SenderTransport {
     case tcp(NWEndpoint)                   // WiFi (Bonjour) or -host/-port override
     case usb(udid: String?, port: UInt16)  // native usbmuxd dial; nil = first device
+    // Remote access (Mac/RemoteAccess.swift): the device dials the Mac's
+    // listener, which authenticates it and hands the connection over via
+    // adoptInbound. This transport never dials anything: after a drop the
+    // session waits for the device to come back.
+    case inbound
 }
 
 @available(macOS 14.0, *)
@@ -106,7 +111,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
-    private let queue = DispatchQueue(label: "sender.video")
+    private let queue: DispatchQueue
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     // The dial target. Written on `queue` only (after init): the controller
@@ -180,7 +185,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // link that died on the way into sleep must get its full grace after
     // wake, not be declared gone by the first tick of the wall clock.
     private var disconnectedSince: TimeInterval?
-    private let disconnectGraceSeconds: TimeInterval = 10
+    // A remote device redials on its own over a cellular path that stalls
+    // and hands over between networks: keep its display longer.
+    private var disconnectGraceSeconds: TimeInterval { isInbound ? 30 : 10 }
+    // Silence that marks the link dead (PROTOCOL.md 2.4.6: 15s on remote).
+    private var livenessTimeout: TimeInterval { isInbound ? 15 : 5 }
+    // Queue-confined like `transport`.
+    private var isInbound: Bool {
+        if case .inbound = transport { return true }
+        return false
+    }
     private var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     private var lastHello: PhoneInfo?
@@ -378,7 +392,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
          identityOffset: UInt32 = 0, awaitingWake: Bool = false,
-         preferredMirrorDisplayID: String? = nil) {
+         preferredMirrorDisplayID: String? = nil, queue: DispatchQueue? = nil) {
+        // Inbound connections are started by the remote listener before this
+        // session exists, and their callbacks fire on the queue they were
+        // started on — so remote sessions share that queue (see RemoteListener).
+        self.queue = queue ?? DispatchQueue(label: "sender.video")
         self.transport = transport
         self._mirrorDisplayID = preferredMirrorDisplayID
         self.endpointName = name
@@ -1052,6 +1070,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                          completion: (@MainActor (Bool) -> Void)? = nil) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
+            // A remote session is never moved: the Mac does not dial out.
+            if self.isInbound {
+                Log.info("transport switch ignored for remote session \(self.endpointName)")
+                Task { @MainActor in completion?(false) }
+                return
+            }
             // A working link is only given up for a cable that answered.
             if case .usb(let udid, let port) = newTransport, self.connectionReady,
                let live = self.connection {
@@ -1227,6 +1251,30 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.disconnectedSince = self.uptime   // fresh grace window
             self.scheduleReconnect()
         }
+    }
+
+    /// Remote access: run (or resume) the session over a connection the
+    /// remote listener already authenticated (PROTOCOL.md 2.4.4). It must
+    /// have been started on this sender's queue. A newer connection from the
+    /// same device replaces the live one, keeping display and capture —
+    /// the same make-before-break swap as a cable upgrade.
+    func adoptInbound(_ conn: NWConnection) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, self.isInbound else {
+                conn.cancel()
+                return
+            }
+            Log.info("remote connection adopted for \(self.endpointName)")
+            self.adoptLive(conn)
+        }
+    }
+
+    /// Queue an extra control message on the live connection (e.g. the
+    /// remote-access `remoteHost` update). Dropped while not connected.
+    func sendControlMessage(_ message: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: message),
+              let json = String(data: data, encoding: .utf8) else { return }
+        queue.async { [weak self] in self?.sendJSONFrame(json) }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -1539,6 +1587,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         switch transport {
         case .tcp(let endpoint): connectTCP(endpoint)
         case .usb(let udid, let port): connectUSB(udid: udid, port: port)
+        case .inbound: break   // the device dials back; adoptInbound resumes
         }
     }
 
@@ -1608,7 +1657,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // -forceUpgradeProbe YES: dev knob — loopback runs never look like
         // WiFi, so this is the only way to exercise probe+migrate on one Mac.
         if currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
-            if pairingSecret == nil { startUpgradeProbing() }
+            // Never on remote sessions: probes are plaintext dials.
+            if pairingSecret == nil, !isInbound { startUpgradeProbing() }
         } else {
             stopUpgradeProbing()   // already off WiFi — nothing better to find
         }
@@ -1958,7 +2008,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             } else {
                 disconnectedSince = uptime
-                Task { await status("Connection lost — retrying for \(Int(disconnectGraceSeconds))s…") }
+                let text = isInbound
+                    ? "Connection lost — waiting \(Int(disconnectGraceSeconds))s for the device to reconnect…"
+                    : "Connection lost — retrying for \(Int(disconnectGraceSeconds))s…"
+                Task { await status(text) }
             }
         }
         connectionReady = false
@@ -2009,7 +2062,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func scheduleWatchdog() {
         queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
-            if self.connectionReady, Date().timeIntervalSince(self.lastReceived) > 5 {
+            if self.connectionReady, Date().timeIntervalSince(self.lastReceived) > self.livenessTimeout {
                 // A suspended receiver app (user switched apps) goes silent
                 // like this while its kernel still accepts redials — the
                 // session and display are kept on purpose so the user's
@@ -2021,7 +2074,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     // redial onto WiFi.
                     self.linkDied("silent for >5s")
                 } else {
-                    Log.info("watchdog: nothing from the phone for >5s — reconnecting")
+                    Log.info("watchdog: nothing from the phone for >\(Int(self.livenessTimeout))s — reconnecting")
                     // Can't tell a backgrounded receiver from a brief stall here
                     // (both go silent while redials still succeed) — hedge.
                     Task { await self.status("\(self.endpointName) is silent — keeping the display (app in background or brief stall)") }

@@ -95,6 +95,10 @@ enum MainWindow {
 enum ConnectionTarget: Hashable {
     case usb(udid: String?)           // wired via built-in usbmuxd; nil = first device
     case wifi(NWBrowser.Result)       // discovered via Bonjour
+    // Remote access (Mac/RemoteAccess.swift): an authenticated inbound
+    // connection from a USB-paired device, keyed by its key fingerprint.
+    // Never dialed — the device connects to the Mac.
+    case remote(peerID: String)
 
     /// Stable identity for sessions and persistence — survives Bonjour
     /// re-discovery (fresh NWBrowser.Result) and USB replugs (new DeviceID).
@@ -104,6 +108,7 @@ enum ConnectionTarget: Hashable {
         case .wifi(let result):
             if case .service(let name, _, _, _) = result.endpoint { return "wifi:\(name)" }
             return "wifi:unknown"
+        case .remote(let peerID): return "remote:\(peerID)"
         }
     }
 }
@@ -150,7 +155,12 @@ final class DeviceSession: ObservableObject, Identifiable {
     // rather than WiFi — reported by the sender once connected.
     @Published var wired = false
 
-    var transportLabel: String { onUSB ? "USB" : wired ? "Cable" : "WiFi" }
+    var isRemote: Bool {
+        if case .remote = target { return true }
+        return false
+    }
+
+    var transportLabel: String { isRemote ? "Distant" : onUSB ? "USB" : wired ? "Cable" : "WiFi" }
 
     init(id: String, target: ConnectionTarget, name: String, sender: MacSender) {
         self.id = id
@@ -245,6 +255,28 @@ final class SenderController: ObservableObject {
     private let autoConnectEnabled = UserDefaults.standard.object(forKey: "autostart") == nil
         || UserDefaults.standard.bool(forKey: "autostart")
 
+    // MARK: Remote access state (logic in Mac/RemoteAccess.swift)
+
+    @Published var remoteAccessEnabled = RemoteSettings.enabled {
+        didSet {
+            guard remoteAccessEnabled != oldValue else { return }
+            RemoteSettings.enabled = remoteAccessEnabled
+            remoteSettingsChanged()
+        }
+    }
+    // Edited as text, applied on submit (commitRemotePort).
+    @Published var remotePortText = String(RemoteSettings.port)
+    // Edited as text, applied on submit (commitRemotePublicHost).
+    @Published var remotePublicHost = RemoteSettings.publicHost ?? ""
+    @Published var remotePeers: [RemotePeer] = RemoteStore.peers()
+    @Published var remoteAddresses: [String] = []
+    @Published var remoteListenerStatus = ""
+    let remoteListener = RemoteListener()
+    // Remote peers the user disconnected: their redials are turned away
+    // for a while instead of reopening the session at once.
+    var remoteSuppressedUntil: [String: Date] = [:]
+    var remotePathMonitor: NWPathMonitor?
+
     // Bonjour usually reports devices before usbmuxd does — WiFi reconnects
     // wait out this window so a cabled device is dialed over USB first. After
     // it, a remembered WiFi device (connected before, never disconnected by
@@ -277,6 +309,7 @@ final class SenderController: ObservableObject {
                 MainActor.assumeIsolated { self?.macDidWake(note.name.rawValue) }
             })
         }
+        setUpRemoteAccess()
     }
 
     /// The Mac (or just its screens) woke up. Nothing else would make the
@@ -293,6 +326,7 @@ final class SenderController: ObservableObject {
             // Let the network and WindowServer settle before dialing.
             try? await Task.sleep(for: .seconds(2))
             self.autoConnect()
+            self.remoteNetworkChanged()   // a new network may mean new addresses
         }
     }
 
@@ -517,7 +551,8 @@ final class SenderController: ObservableObject {
     /// withdrawal that persists counts. One-shot, guarded re-check, so
     /// overlapping browse events at worst repeat an idempotent call.
     private func endSessionsWhoseServiceVanished() {
-        for session in sessions where !session.onUSB {
+        // Remote sessions have no service to lose: their grace is the sender's.
+        for session in sessions where !session.onUSB && !session.isRemote {
             guard wifiService(for: session) == nil else { continue }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak session] in
                 guard let self, let session,
@@ -577,6 +612,8 @@ final class SenderController: ObservableObject {
             return udid == nil ? "Manual (\(host):\(port))" : "iPhone / iPad"
         case .wifi(let result):
             return serviceName(of: result) ?? "WiFi device"
+        case .remote(let peerID):
+            return remotePeers.first { $0.id == peerID }?.name ?? "Appareil distant"
         }
     }
 
@@ -602,13 +639,19 @@ final class SenderController: ObservableObject {
         UInt32(clamping: UserDefaults.standard.integer(forKey: Self.identityOffsetKey(for: id)))
     }
 
+    /// `inbound`: for `.remote` only, the connection RemoteListener already
+    /// authenticated. A remote target without one is never dialed.
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
-                 awaitingWake: Bool = false) {
+                 awaitingWake: Bool = false, inbound: NWConnection? = nil) {
+        if case .remote = target, inbound == nil { return }
         let id = target.sessionID
         if let existing = session(for: id) {
             // A failed session holds no pipeline — replace the corpse
             // instead of letting it swallow the fresh attempt.
-            guard existing.failed else { return }
+            guard existing.failed else {
+                inbound?.cancel()
+                return
+            }
             end(existing)
         }
 
@@ -637,6 +680,7 @@ final class SenderController: ObservableObject {
         switch target {
         case .usb: usbDisabled.remove(id)
         case .wifi: wifiRemembered.insert(id)
+        case .remote: break
         }
 
         // Paired-only WiFi: never dial a receiver this Mac holds no key for.
@@ -662,14 +706,19 @@ final class SenderController: ObservableObject {
             }
         case .wifi(let result):
             transport = .tcp(result.endpoint)
+        case .remote:
+            transport = .inbound
         }
 
         let name = label(for: target)
+        // Inbound connections run on the remote listener's queue — their
+        // callbacks are bound to the queue they were started on.
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake,
-                               preferredMirrorDisplayID: mirrorDisplayID)
+                               preferredMirrorDisplayID: mirrorDisplayID,
+                               queue: inbound != nil ? RemoteListener.queue : nil)
         sender.setPairingSecret(secret)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
@@ -689,6 +738,9 @@ final class SenderController: ObservableObject {
             if case .usb(let udid?) = session.target, let installID = info.id {
                 self.installIDByUDID[udid] = installID
             }
+            // Remote access: address update for remote peers, and a local
+            // session takes over from a remote one for the same device.
+            self.remoteHelloReceived(info, session: session)
             self.dedupeSessions()
             // The learned identity may reveal that this WiFi session's device
             // is cabled — take the upgrade opportunity right away.
@@ -769,6 +821,7 @@ final class SenderController: ObservableObject {
             self.end(session)
         }
         sessions.append(session)
+        if let inbound { sender.adoptInbound(inbound) }
         Task {
             do {
                 try await sender.start()
@@ -791,6 +844,7 @@ final class SenderController: ObservableObject {
         switch session.target {
         case .usb: usbDisabled.insert(session.id)
         case .wifi: wifiRemembered.remove(session.id)
+        case .remote(let peerID): suppressRemote(peerID)
         }
         // A migrated session is also reachable the other way — opt that side
         // out too, or auto-connect resurrects the device moments later.
@@ -812,7 +866,7 @@ final class SenderController: ObservableObject {
         connect(to: target, userInitiated: true)
     }
 
-    private func end(_ session: DeviceSession) {
+    func end(_ session: DeviceSession) {
         session.sender.stop()
         sessions.removeAll { $0.id == session.id }
     }
@@ -1090,6 +1144,8 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                RemoteAccessSection(controller: controller)
 
                 Section("Permissions") {
                     permissionRow(
