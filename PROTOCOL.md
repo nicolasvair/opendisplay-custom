@@ -255,13 +255,32 @@ The dialogue uses the line framing of 2.3 (one JSON object per line,
 base64 per RFC 4648 section 4):
 
 ```
-Mac    -> device  rpHello   {v, name, sk, ek, pid}
+Mac    -> device  rpCommit  {v, c}
 device -> Mac     rpHello   {v, name, sk, ek, iid}
+Mac    -> device  rpHello   {v, name, sk, ek, pid}
           (both screens show code(T); the user accepts on each device)
 Mac    -> device  rpConfirm {sig, addrs, port}
 device -> Mac     rpConfirm {sig}
 either            rpAbort   {}
 ```
+
+**`rpCommit`.** The Mac fixes its whole hello (including its fresh `ek` and
+`pid`) before the dialogue starts and sends only a commitment to it: `c` is
+the base64 of
+
+```
+C = SHA-256( "opendisplay-remote-commit-v1" 0x00 "mac"
+             ‖ LV(mac.sk) ‖ LV(mac.ek) ‖ LV(mac.name) ‖ LV(mac.pid) ‖ LV("") )
+```
+
+(`LV` and the normalized `name` as for `T` below; the last field is an
+empty install ID). The device sends its own `rpHello` only after receiving
+`rpCommit`, and on receiving the Mac's `rpHello` it MUST recompute `C` and
+abort unless it equals the commitment. The Mac sends its `rpHello` only
+after receiving the device's. So each side's hello is fixed before it can
+know the other's: neither a peer nor a man in the middle playing either
+role can try hello variants (a different `name` or `iid` costs nothing)
+until the codes on both screens match.
 
 **`rpHello`** fields:
 
@@ -277,10 +296,11 @@ either            rpAbort   {}
 
 A peer MUST reject a hello whose `sk` is not a valid P-256 point, whose
 `ek` is not a valid X25519 key, or (from the Mac) whose `pid` is not 32
-lowercase hex characters. The official apps truncate `name` and `iid` to 64
-characters and substitute a default for an empty `name`; since the
-transcript covers these values as received, a sender MUST NOT send an
-empty or longer value, or the two sides compute different transcripts.
+lowercase hex characters. Before hashing, both sides normalize each `name`:
+remove Unicode control (Cc) and format (Cf) characters (bidi overrides
+included), trim surrounding whitespace, keep at most 64 characters, and
+substitute `"Mac"` / `"Appareil"` for an empty result. `iid` is truncated
+to 64 characters.
 
 **Transcript.** Both sides compute
 
@@ -321,8 +341,9 @@ Mac's confirm also carries `addrs` (array of strings: the hosts the device
 should dial, in order of preference, as IP literals without brackets or
 zone IDs, or DNS names) and `port` (integer, the Mac's remote listener
 port); these are the initial values `remoteHost` (2.4.5) later updates. The
-confirms are independent: neither side waits for the peer's confirm before
-sending its own, so they MAY cross on the wire.
+Mac sends its confirm as soon as its user accepts and MUST NOT wait for the
+device's. The device sends its confirm only after its user accepted **and**
+the Mac's confirm verified.
 
 **Completion.** Each side stores the peer only when **both** hold: its own
 user accepted, and the peer's `rpConfirm` signature verifies against the
@@ -347,9 +368,11 @@ device closes its pairing listener when the attempt ends.
    (TLS 1.2 only, `TLS_PSK_WITH_AES_128_GCM_SHA256`), PSK identity = the
    UTF-8 bytes of `pid`, PSK = the pairing's secret. The Mac's listener
    holds the PSK of every remote peer and selects it by identity. A wrong
-   or unknown PSK fails the handshake. The Mac SHOULD close a connection
-   whose TLS handshake has not completed within 5 s of being accepted, so
-   an idle or non-TLS client holds nothing open.
+   or unknown PSK fails the handshake. The Mac MUST close a connection that
+   has not completed steps 1 to 4 within 5 s of being accepted (one budget
+   for the handshake and the device's `rauth`), so an idle or non-TLS
+   client holds nothing open. It SHOULD bound unauthenticated connections
+   per source and in total, evicting the oldest rather than refusing new ones.
 2. Both ends derive `E`, 32 bytes of keying material exported from this TLS
    session per RFC 5705 with label `"EXPORTER-opendisplay-remote-auth-v1"`
    and no context value.
@@ -363,13 +386,17 @@ device closes its pairing listener when the attempt ends.
    with `sig` = sign_device(auth payload(`device`)).
 4. The Mac reads **exactly one** frame and nothing past it. It MUST close
    the connection, without sending anything, unless all of the following
-   hold within **5 s** of the TLS handshake completing: the payload is
+   hold within the 5 s budget of step 1: the payload is
    1 to **1024** bytes; it parses as a JSON object; `type` is `"rauth"`; `v`
    is `1`; `pid` is 32 lowercase hex characters naming a paired remote peer;
    and `sig` verifies against that peer's pinned key over the auth payload
    with role `device` and that `pid`. A Mac whose TLS stack exposes the
    negotiated PSK identity SHOULD also require it to equal `pid`.
-5. The Mac answers with its own first frame,
+5. If the Mac will not run a session for this peer anyway (the user
+   disconnected it, or it already has a live cabled session), it closes
+   here without answering, so the device sees an authentication that did
+   not complete rather than a session that dies at once. Otherwise it
+   answers with its own first frame,
 
    ```json
    {"type":"rauth","v":1,"sig":"<base64>"}
@@ -403,7 +430,7 @@ Sender to receiver, additive (section 6 rules apply: a peer that does not
 know it ignores it):
 
 ```json
-{"type":"remoteHost","fp":"<mac fingerprint>","addrs":["2001:db8::1234","mac.example.ts.net"],"port":9010}
+{"type":"remoteHost","fp":"<mac fingerprint>","addrs":["2001:db8::1234","mac.example.ts.net"],"port":9010,"sig":"<base64>"}
 ```
 
 | Field | Meaning |
@@ -411,19 +438,20 @@ know it ignores it):
 | `fp` | The fingerprint (32 lowercase hex characters) of the sending Mac's remote identity |
 | `addrs` | The hosts to dial, in order of preference, in the form of `rpConfirm.addrs` |
 | `port` | The Mac's remote listener port, 1 to 65535 |
+| `sig` | The Mac's long-term signature over `"opendisplay-remote-host-v1" 0x00 fp 0x00 port` (port in decimal ASCII) ‖ `LV(addr)` for each entry of `addrs` in order |
 
-The Mac sends it on any session with a device it holds as a remote peer
-(USB, paired WiFi or remote), after the session starts and whenever its
-address set or port changes, so a device follows a changed IPv6 prefix
-without pairing again. The device MUST apply it only to the stored Mac
-whose fingerprint equals `fp`, replacing its `addrs` and `port`, and MUST
-ignore it otherwise. It MAY keep only the first 16 entries and truncate each
-to 255 characters. The Mac SHOULD list stable addresses (on macOS the
+The Mac sends it on USB and remote sessions with a device it holds as a
+remote peer (not on WiFi sessions, whose device identity is only claimed),
+after the session starts and whenever its address set or port changes, so a
+device follows a changed IPv6 prefix without pairing again. The device MUST
+apply it only to the stored Mac whose fingerprint equals `fp` and only if
+`sig` verifies against that Mac's pinned key, replacing its `addrs` and
+`port`; it MUST ignore it otherwise, on whatever session it arrived. A
+message with more than 16 entries, or an entry that is empty or longer
+than 255 characters, is invalid. The Mac SHOULD list stable addresses (on macOS the
 `secured` IPv6 address, not the rotating temporary ones), MUST NOT list
 link-local addresses, and MAY add user-configured names or overlay-network
-addresses (Tailscale). `fp` is a claim on USB and WiFi sessions; a forged
-update can at most make the device dial the wrong host, where
-authentication (2.4.4) fails.
+addresses (Tailscale).
 
 #### 2.4.6 Session rules
 
@@ -445,7 +473,12 @@ remote session:
   has a live remote session SHOULD replace it (section 1). A connection that
   has not completed 2.4.4 MUST NOT affect any live session.
 * **Visibility.** The Mac SHOULD notify its user each time a remote session
-  is authenticated, naming the device, so an unexpected use is noticed.
+  is opened, naming the device, so an unexpected use is noticed. A
+  reconnection adopted into a session still in its grace period MAY be
+  silent.
+* **Cabled supersedes remote.** When a remote peer's device also arrives
+  over USB, the Mac ends the remote session. A WiFi arrival does not, since
+  its identity is only claimed.
 * **Revocation.** Forgetting a remote peer on the Mac MUST remove its PSK
   from the listener and close any live session with it immediately.
   Forgetting the Mac on the device deletes the stored record; the device
@@ -946,7 +979,7 @@ Sender to receiver:
 |---|---|---|
 | `displays` | `list`, `selected`? | The Mac screens that can be mirrored and the one in use |
 | `streamConfig` | adds `mode` | In addition to the fields of section 6.5, the sender's current mode (`"extend"` or `"mirror"`), so the receiver can show its switch |
-| `remoteHost` | `fp`, `addrs`, `port` | The Mac's current remote-access addresses, so a device paired for remote access follows a changed IPv6 prefix (section 2.4.5) |
+| `remoteHost` | `fp`, `addrs`, `port`, `sig` | The Mac's current remote-access addresses, so a device paired for remote access follows a changed IPv6 prefix (section 2.4.5) |
 
 The remote-access binding (section 2.4) also defines `rauth`, the first
 frame in each direction of a remote session. It is part of session
