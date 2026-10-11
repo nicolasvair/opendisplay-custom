@@ -845,13 +845,19 @@ extension SenderController {
     /// through usbmuxd. Only such a session's install ID is backed by
     /// something stronger than the receiver's own word: a WiFi device (even
     /// a code-paired one) could claim any install ID in its hello.
+    /// Set from the transport its last hello arrived through, so a WiFi
+    /// session that migrated onto the cable counts once it says hello there.
     private func isCabled(_ session: DeviceSession) -> Bool {
-        guard case .usb = session.target else { return false }
-        return session.onUSB && session.usbUDID != nil
+        session.onUSB && session.usbUDID != nil && remoteCabledSessions.contains(session.id)
     }
 
     /// Every hello, on any transport.
-    func remoteHelloReceived(_ info: PhoneInfo, session: DeviceSession) {
+    func remoteHelloReceived(_ info: PhoneInfo, session: DeviceSession, cabledUDID: String?) {
+        if cabledUDID != nil {
+            remoteCabledSessions.insert(session.id)
+        } else {
+            remoteCabledSessions.remove(session.id)
+        }
         if let installID = info.id, isCabled(session) {
             // The device is on the cable now: the USB session wins, the
             // remote one for the same device ends. A WiFi session never

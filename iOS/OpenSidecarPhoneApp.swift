@@ -518,7 +518,7 @@ private struct RemoteHostRow: View {
     private var detail: String {
         if isShown, remote.status != .idle { return remote.status.text }
         if host.addresses.isEmpty {
-            return "Aucune adresse connue — connecte le Mac en USB ou en WiFi pour la recevoir"
+            return "Aucune adresse connue — branche ce \(deviceKind) au Mac par câble pour la recevoir"
         }
         return "\(host.addresses.count) adresse(s), port \(host.port)"
     }

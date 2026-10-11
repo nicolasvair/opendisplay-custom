@@ -285,6 +285,8 @@ final class SenderController: ObservableObject {
     // Remote peers the user disconnected: their redials are turned away
     // for a while instead of reopening the session at once.
     var remoteSuppressedUntil: [String: Date] = [:]
+    // Sessions whose last hello arrived through usbmuxd (see isCabled).
+    var remoteCabledSessions: Set<String> = []
     var remotePathMonitor: NWPathMonitor?
 
     // Bonjour usually reports devices before usbmuxd does — WiFi reconnects
@@ -741,7 +743,7 @@ final class SenderController: ObservableObject {
             session.status = text
             Log.info("status[\(id)]: \(text)")
         }
-        sender.onHello = { [weak self, weak session] info in
+        sender.onHello = { [weak self, weak session] info, cabledUDID in
             guard let self, let session else { return }
             session.deviceID = info.id
             session.deviceKind = info.device
@@ -750,7 +752,7 @@ final class SenderController: ObservableObject {
             }
             // Remote access: address update for remote peers, and a USB
             // session takes over from a remote one for the same device.
-            self.remoteHelloReceived(info, session: session)
+            self.remoteHelloReceived(info, session: session, cabledUDID: cabledUDID)
             self.dedupeSessions()
             // The learned identity may reveal that this WiFi session's device
             // is cabled — take the upgrade opportunity right away.
@@ -886,6 +888,7 @@ final class SenderController: ObservableObject {
     func end(_ session: DeviceSession) {
         session.sender.stop()
         sessions.removeAll { $0.id == session.id }
+        remoteCabledSessions.remove(session.id)
     }
 
     /// Mode/quality apply per-pipeline at construction — rebuild every session.

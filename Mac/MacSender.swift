@@ -88,7 +88,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor var onTransportPath: ((_ wired: Bool) -> Void)?
     // Fired on every hello — carries the receiver's install id so the
     // controller can deduplicate USB/WiFi sessions to the same device.
-    @MainActor var onHello: ((PhoneInfo) -> Void)?
+    // `cabledUDID` is the usbmuxd device the hello arrived through, nil on
+    // any other transport: decided from the live connection, so it also
+    // holds for a WiFi session that migrated onto the cable.
+    @MainActor var onHello: ((_ info: PhoneInfo, _ cabledUDID: String?) -> Void)?
     // Fired when the user stopped the capture from the system UI (menu-bar
     // recording indicator / "Stop Extending"). The controller disconnects
     // the session — teardown plus auto-connect opt-out — so the app honors
@@ -2369,13 +2372,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard len > 0, len < 1 << 20 else { return }
             conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
                 guard let self, error == nil, let payload, payload.count == len else { return }
-                self.handleControl(payload)
+                self.handleControl(payload, from: conn)
                 self.receiveControl(on: conn)
             }
         }
     }
 
-    private func handleControl(_ payload: Data) {
+    private func handleControl(_ payload: Data, from source: NWConnection) {
         lastReceived = Date()
         guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let type = obj["type"] as? String else {
@@ -2421,7 +2424,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // A fresh dial classifies before the hello names the device —
                 // now that it has, decide again (see the comment on the func).
                 if let conn = connection { refreshDirectLinkClassification(for: conn) }
-                Task { @MainActor in self.onHello?(info) }
+                // `transport` and `connection` change together on `queue`, so
+                // a hello from the live connection came over that transport.
+                var cabledUDID: String?
+                if source === connection, case .usb(let udid?, _) = transport { cabledUDID = udid }
+                Task { @MainActor in self.onHello?(info, cabledUDID) }
                 if let port = info.cursorPort {
                     openCursorChannel(port: port)
                 } else {

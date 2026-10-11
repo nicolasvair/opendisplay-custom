@@ -3,7 +3,7 @@
 L'accès à distance permet d'utiliser l'iPhone ou l'iPad comme écran du Mac
 **hors du réseau local** : depuis la 4G/5G, un autre WiFi, etc. Ce document
 est le guide utilisateur et le modèle de sécurité. Le format exact des
-messages est spécifié dans [PROTOCOL.md](../PROTOCOL.md), section 2.4.
+messages est spécifié dans [PROTOCOL.md](PROTOCOL.md), section 2.4.
 
 > Les noms de boutons et de réglages cités ici peuvent différer légèrement de
 > ceux de l'app ; le principe et l'ordre des étapes, eux, ne changent pas.
@@ -166,9 +166,10 @@ UDP).
 
 Le préfixe IPv6 attribué par la box peut changer (redémarrage, opérateur).
 Le Mac renvoie automatiquement ses adresses à l'appareil à chaque session
-(USB, WiFi appairé ou distante). Si le préfixe change pendant que vous êtes
-dehors **sans session ouverte**, l'appareil ne retrouvera pas le Mac avant
-la prochaine session à la maison (USB ou WiFi suffit, pas besoin de
+**par câble USB ou distante** (jamais sur une session WiFi seule, où
+l'identité de l'appareil n'est que déclarée). Si le préfixe change pendant
+que vous êtes dehors **sans session ouverte**, l'appareil ne retrouvera pas
+le Mac avant la prochaine session par câble à la maison (pas besoin de
 réappairer). Tailscale évite ce problème : l'adresse Tailscale ne change pas.
 
 ## 5. Ce qui est protégé, et les limites
@@ -226,7 +227,8 @@ Si la box filtre l'IPv6 entrant (ou pour ne rien exposer sur Internet) :
    comme une autre. Vérifiez dans les réglages d'accès à distance du Mac
    qu'elle figure parmi les adresses transmises à l'appareil ; si ce n'est
    pas le cas, ajoutez-la (si le réglage le permet), puis reconnectez une
-   fois l'appareil en USB ou WiFi pour qu'il la reçoive.
+   fois l'appareil **par câble USB**, app ouverte au premier plan, pour qu'il
+   la reçoive.
 4. Sur l'appareil, activez le VPN Tailscale avant de lancer la connexion.
 
 Avec Tailscale seul, vous pouvez restreindre le coupe-feu du Mac pour que le
@@ -268,7 +270,7 @@ Résultats à consigner :
 
 | Date | Mac / macOS | Secure Enclave | TLS 1.2 PSK + exporteur | Mauvaise clé refusée | TLS 1.3 PSK | Remarques |
 |---|---|---|---|---|---|---|
-| | | | | | | |
+| 2026-10-11 | MacBook Pro M1 Pro / macOS 15.6.1 | PASS | PASS | PASS | Ne se connecte pas (informatif) | Script lancé non signé |
 
 ## 9. Recette manuelle
 
@@ -326,7 +328,9 @@ les journaux des deux côtés en cas de doute.
 - [ ] **Notification** : chaque session distante authentifiée affiche une
   notification sur le Mac avec le nom de l'appareil.
 - [ ] **Adresse mise à jour** : après un changement de préfixe IPv6 (ou un
-  ajout d'adresse Tailscale), une session USB ou WiFi suffit pour que
-  l'appareil retrouve le Mac à distance, sans réappairage.
+  ajout d'adresse Tailscale), une session par câble USB suffit pour que
+  l'appareil retrouve le Mac à distance, sans réappairage — y compris une
+  session WiFi qui bascule sur le câble au branchement. Une session WiFi
+  seule ne transmet pas les adresses.
 - [ ] **Accès à distance désactivé** : rien n'écoute sur le port
   (`lsof -nP -iTCP:9010 -sTCP:LISTEN` vide), l'appareil échoue proprement.
