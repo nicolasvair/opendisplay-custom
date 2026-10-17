@@ -275,11 +275,12 @@ final class MacKeyInputView: UIView, UIKeyInput {
     }
 }
 
-/// The Mac keys row: Esc, Tab, ⇧ ⌃ ⌥ ⌘ (one-shot), arrows. Overlaid on the
+/// The Mac keys row: dictation, Esc, Tab, ⇧ ⌃ ⌥ ⌘ (one-shot), arrows. Overlaid on the
 /// bottom of the picture just above the bar, or above a docked keyboard; a
 /// floating keyboard never covers it.
 struct MacKeysRow: View {
     @ObservedObject var controls = LocalControls.shared
+    @ObservedObject var dictation = DictationController.shared
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     static let keyHeight: CGFloat = 43
@@ -291,6 +292,9 @@ struct MacKeysRow: View {
     var body: some View {
         if controls.keyboardVisible {
             HStack(alignment: .bottom, spacing: gap) {
+                key(systemImage: dictation.isListening ? "mic.fill" : "mic",
+                    active: dictation.isListening) { dictation.toggle() }
+                divider
                 sendKey("esc", 53)
                 sendKey("tab", 48)
                 modKey("⇧", 8)
@@ -361,10 +365,12 @@ struct MacKeysRow: View {
         }
     }
 
-    private func key(_ title: String, active: Bool, locked: Bool = false,
-                     action: @escaping () -> Void) -> some View {
+    private func key(_ title: String = "", systemImage: String? = nil, active: Bool,
+                     locked: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title)
+            Group {
+                if let systemImage { Image(systemName: systemImage) } else { Text(title) }
+            }
                 .font(.system(size: 18, weight: .medium))
                 .foregroundColor(.white)
                 .frame(minWidth: keyWidth, minHeight: keyHeight)
