@@ -269,14 +269,20 @@ struct MacKeysRow: View {
                 ForEach([("⌘", 1), ("⌥", 2), ("⌃", 4), ("⇧", 8)], id: \.1) { title, bit in
                     key(title, active: controls.mods & bit != 0) { controls.mods ^= bit }
                 }
-                Divider().frame(height: 24).overlay(Color.white.opacity(0.3))
-                ForEach([("esc", 53), ("tab", 48), ("←", 123), ("↓", 125),
-                         ("↑", 126), ("→", 124), ("⌦", 117)], id: \.1) { title, code in
-                    key(title, active: false) {
-                        controls.receiver?.sendKey(code: code, mods: controls.takeMods())
+                Divider().frame(height: 29).overlay(Color.white.opacity(0.3))
+                sendKey("esc", 53)
+                sendKey("tab", 48)
+                // Inverted T, as on the Mac keyboard: ↑ over ← ↓ →.
+                VStack(spacing: 4) {
+                    sendKey("↑", 126)
+                    HStack(spacing: 6) {
+                        sendKey("←", 123)
+                        sendKey("↓", 125)
+                        sendKey("→", 124)
                     }
                 }
-                Divider().frame(height: 24).overlay(Color.white.opacity(0.3))
+                sendKey("⌦", 117)
+                Divider().frame(height: 29).overlay(Color.white.opacity(0.3))
                 key("⌨︎↓", active: false) { controls.keyboardVisible = false }
             }
             .padding(.horizontal, 10)
@@ -287,13 +293,19 @@ struct MacKeysRow: View {
         }
     }
 
+    private func sendKey(_ title: String, _ code: Int) -> some View {
+        key(title, active: false) {
+            controls.receiver?.sendKey(code: code, mods: controls.takeMods())
+        }
+    }
+
     private func key(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 18, weight: .medium))
+                .font(.system(size: 22, weight: .medium))
                 .foregroundColor(.white)
-                .frame(minWidth: 48, minHeight: 36)
-                .background(RoundedRectangle(cornerRadius: 7)
+                .frame(minWidth: 58, minHeight: 43)
+                .background(RoundedRectangle(cornerRadius: 8)
                     .fill(active ? Color.accentColor : Color.white.opacity(0.18)))
                 .contentShape(Rectangle())
         }
