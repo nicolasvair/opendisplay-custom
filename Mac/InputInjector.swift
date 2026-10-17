@@ -42,6 +42,10 @@ final class InputInjector {
     private let vendorPointerType: Int64 = 0x0802    // Grip Pen (what apps expect)
     private let capabilityMask: Int64 = 0x05C7       // pressure + tilt + rotation + buttons
     private var inRange = false
+    /// Modifiers held for the current press (from the receiver's keys row):
+    /// pressed before the button goes down, set on every event of the press,
+    /// released after it comes up so none is left held for the next click.
+    private var clickFlags: CGEventFlags = []
 
     // Pencil-only synthetic click counting — tablet events don't get click
     // state from the Window Server, so we mirror macOS double-click prefs here.
@@ -98,7 +102,7 @@ final class InputInjector {
     }
 
     /// x/y are normalized [0,1] in video space (origin top-left).
-    func handleTouch(phase: String, x: Double, y: Double, allowTrackpad: Bool = true) {
+    func handleTouch(phase: String, x: Double, y: Double, allowTrackpad: Bool = true, mods: Int = 0) {
         let mode = PointerModeState.shared.mode
         if mirrored, mode == .trackpad, lastMode != .trackpad { bringCursorOntoDisplay() }
         lastMode = mode
@@ -123,6 +127,7 @@ final class InputInjector {
             pressIsRight = PointerModeState.shared.takeRightClick(at: point)
             type = pressIsRight ? .rightMouseDown : .leftMouseDown
             isDown = true
+            holdClickModifiers(mods)
         case "moved":
             type = isDown ? (pressIsRight ? .rightMouseDragged : .leftMouseDragged) : .mouseMoved
         case "ended":
@@ -142,7 +147,21 @@ final class InputInjector {
                                   mouseCursorPosition: point,
                                   mouseButton: pressIsRight ? .right : .left) else { return }
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+        if !clickFlags.isEmpty { event.flags = clickFlags }
         event.post(tap: .cghidEventTap)
+        if !isDown { releaseClickModifiers() }
+    }
+
+    private func holdClickModifiers(_ mods: Int) {
+        releaseClickModifiers()
+        clickFlags = KeyPoster.flags(mods)
+        KeyPoster.postModifiers(clickFlags, down: true, source: source)
+    }
+
+    private func releaseClickModifiers() {
+        guard !clickFlags.isEmpty else { return }
+        KeyPoster.postModifiers(clickFlags, down: false, source: source)
+        clickFlags = []
     }
 
     // MARK: - Trackpad mode
@@ -332,13 +351,15 @@ final class InputInjector {
         // Apps that read raw deltas (games, some canvases) get them too.
         event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
         event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+        if !clickFlags.isEmpty { event.flags = clickFlags }
         event.post(tap: .cghidEventTap)
         return to
     }
 
     /// A button press or release at the cursor, or at normalized (nx, ny) on
     /// the streamed display when given (touch mode's armed right click).
-    func handleButton(right: Bool, down: Bool, clicks: Int, nx: Double? = nil, ny: Double? = nil) {
+    func handleButton(right: Bool, down: Bool, clicks: Int, nx: Double? = nil, ny: Double? = nil,
+                      mods: Int = 0) {
         if let nx, let ny {
             lastPointer = (screenPoint(nx: nx, ny: ny), CFAbsoluteTimeGetCurrent())
         }
@@ -349,8 +370,10 @@ final class InputInjector {
         case (true, true): type = .rightMouseDown; localRightDown = true
         case (true, false): guard localRightDown else { return }; type = .rightMouseUp; localRightDown = false
         }
+        if down, !(localLeftDown && localRightDown) { holdClickModifiers(mods) }
         postMouse(type, at: pointerPosition(), clickState: max(1, min(clicks, 3)),
                   button: right ? .right : .left)
+        if !localLeftDown, !localRightDown { releaseClickModifiers() }
     }
 
     private func postMouse(_ type: CGEventType, at point: CGPoint, clickState: Int,
@@ -360,6 +383,7 @@ final class InputInjector {
         if clickState > 0 {
             event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         }
+        if !clickFlags.isEmpty { event.flags = clickFlags }
         event.post(tap: .cghidEventTap)
     }
 

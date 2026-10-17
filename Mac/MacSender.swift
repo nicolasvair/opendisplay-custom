@@ -2483,7 +2483,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // A receiver with local controls runs trackpad mode itself:
                 // its touches are always direct.
                 inputInjector?.handleTouch(phase: phase, x: x, y: y,
-                                           allowTrackpad: lastHello?.hasLocalControls != true)
+                                           allowTrackpad: lastHello?.hasLocalControls != true,
+                                           mods: obj["mods"] as? Int ?? 0)
                 if let t = obj["t"] as? Double {
                     let delta = Date().timeIntervalSince1970 * 1000 - t
                     if delta > -50, delta < 1000 {
@@ -2518,7 +2519,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let down = obj["down"] as? Bool {
                 inputInjector?.handleButton(right: (obj["button"] as? String) == "right", down: down,
                                             clicks: obj["clicks"] as? Int ?? 1,
-                                            nx: obj["x"] as? Double, ny: obj["y"] as? Double)
+                                            nx: obj["x"] as? Double, ny: obj["y"] as? Double,
+                                            mods: obj["mods"] as? Int ?? 0)
             }
         case "text":
             if let text = obj["s"] as? String {

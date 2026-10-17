@@ -858,6 +858,7 @@ struct VideoLayerView: UIViewRepresentable {
             let controls = LocalControls.shared
             trackpad.receiver = receiver
             controls.receiver = receiver
+            receiver?.clickMods = { controls.takeMods() }
             trackpad.pointsPerVideoPixel = { [weak self] in
                 guard let self, let video = self.receiver?.videoSize, video != .zero else { return 1 }
                 return min(self.bounds.width / video.width, self.bounds.height / video.height)

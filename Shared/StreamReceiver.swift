@@ -1325,8 +1325,13 @@ final class StreamReceiver: ObservableObject {
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.
     /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can
     /// measure touch→injection latency without doing its own clock sync.
+    /// Modifier bits (1 ⌘, 2 ⌥, 4 ⌃, 8 ⇧) for a press about to start; the
+    /// Mac holds them until the press ends. Set by the iOS keys row.
+    var clickMods: (() -> Int)?
+
     func sendTouch(phase: String, x: Double, y: Double) {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
+        if phase == "began", let mods = clickMods?(), mods != 0 { msg["mods"] = mods }
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
         sendControl(msg)
     }
@@ -1402,6 +1407,7 @@ final class StreamReceiver: ObservableObject {
         var msg: [String: Any] = ["type": "button", "button": right ? "right" : "left",
                                   "down": down, "clicks": clicks]
         if let point { msg["x"] = point.x; msg["y"] = point.y }
+        if down, let mods = clickMods?(), mods != 0 { msg["mods"] = mods }
         sendControl(msg)
     }
 

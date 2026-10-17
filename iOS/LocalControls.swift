@@ -44,6 +44,9 @@ final class LocalControls: ObservableObject {
     static let keysRowHeight = 2 * MacKeysRow.keyHeight + 4 * MacKeysRow.gap
     /// Sticky one-shot modifiers from the Mac keys row (1 ⌘, 2 ⌥, 4 ⌃, 8 ⇧).
     @Published var mods = 0
+    /// Modifiers locked by a swipe up on their key: they ride on every key
+    /// until tapped again. Same bits as `mods`; a bit is never in both.
+    @Published var lockedMods = 0
     /// Height of a docked keyboard (0 when hidden or floating), so the keys
     /// row can sit above it.
     @Published var dockedKeyboardHeight: CGFloat = 0
@@ -65,10 +68,24 @@ final class LocalControls: ObservableObject {
         ) { [weak self] _ in self?.dockedKeyboardHeight = 0 }
     }
 
+    /// The modifiers for the next key: the one-shot ones (spent here) plus
+    /// the locked ones (kept). The Mac presses and releases them around each
+    /// key, so a locked modifier is never left held between keys or clicks.
     func takeMods() -> Int {
         let current = mods
         if current != 0 { mods = 0 }
-        return current
+        return current | lockedMods
+    }
+
+    /// Tap on a modifier key: unlocks a locked one, else toggles one-shot.
+    func tapModifier(_ bit: Int) {
+        if lockedMods & bit != 0 { lockedMods &= ~bit } else { mods ^= bit }
+    }
+
+    /// Swipe up on a modifier key: locks it (like the iPad's number lock).
+    func lockModifier(_ bit: Int) {
+        mods &= ~bit
+        lockedMods |= bit
     }
     /// Trackpad speed multiplier (0.4…2.5).
     @Published var trackpadSpeed: Double = {
@@ -324,8 +341,18 @@ struct MacKeysRow: View {
             .frame(height: keyHeight)
     }
 
+    /// Tap for one key, swipe up to lock (a bar under the symbol shows it).
     private func modKey(_ title: String, _ bit: Int) -> some View {
-        key(title, active: controls.mods & bit != 0) { controls.mods ^= bit }
+        let locked = controls.lockedMods & bit != 0
+        return key(title, active: locked || controls.mods & bit != 0, locked: locked) {
+            controls.tapModifier(bit)
+        }
+        .highPriorityGesture(DragGesture(minimumDistance: 12).onEnded { drag in
+            guard drag.translation.height < -20,
+                  abs(drag.translation.height) > abs(drag.translation.width) else { return }
+            controls.lockModifier(bit)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        })
     }
 
     private func sendKey(_ title: String, _ code: Int) -> some View {
@@ -334,12 +361,15 @@ struct MacKeysRow: View {
         }
     }
 
-    private func key(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+    private func key(_ title: String, active: Bool, locked: Bool = false,
+                     action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 18, weight: .medium))
                 .foregroundColor(.white)
                 .frame(minWidth: keyWidth, minHeight: keyHeight)
+                .overlay(Capsule().fill(Color.white).frame(width: 14, height: 3)
+                    .padding(.bottom, 5).opacity(locked ? 1 : 0), alignment: .bottom)
                 .background(RoundedRectangle(cornerRadius: 8)
                     .fill(active ? Color.accentColor : Color.white.opacity(0.18)))
                 .contentShape(Rectangle())
