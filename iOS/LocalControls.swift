@@ -262,35 +262,64 @@ final class MacKeyInputView: UIView, UIKeyInput {
 /// floating keyboard never covers it.
 struct MacKeysRow: View {
     @ObservedObject var controls = LocalControls.shared
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    private let keyHeight: CGFloat = 43
+    private let gap: CGFloat = 6
+    private var keyWidth: CGFloat { sizeClass == .regular ? 72 : 50 }
 
     var body: some View {
         if controls.keyboardVisible {
-            HStack(spacing: 6) {
+            HStack(alignment: .bottom, spacing: gap) {
                 ForEach([("⌘", 1), ("⌥", 2), ("⌃", 4), ("⇧", 8)], id: \.1) { title, bit in
                     key(title, active: controls.mods & bit != 0) { controls.mods ^= bit }
                 }
-                Divider().frame(height: 29).overlay(Color.white.opacity(0.3))
+                divider
                 sendKey("esc", 53)
                 sendKey("tab", 48)
                 // Inverted T, as on the Mac keyboard: ↑ over ← ↓ →.
-                VStack(spacing: 4) {
+                VStack(spacing: gap) {
                     sendKey("↑", 126)
-                    HStack(spacing: 6) {
+                        .anchorPreference(key: UpKeyBounds.self, value: .bounds) { $0 }
+                    HStack(spacing: gap) {
                         sendKey("←", 123)
                         sendKey("↓", 125)
                         sendKey("→", 124)
                     }
                 }
                 sendKey("⌦", 117)
-                Divider().frame(height: 29).overlay(Color.white.opacity(0.3))
+                divider
                 key("⌨︎↓", active: false) { controls.keyboardVisible = false }
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.85)))
+            .padding(.vertical, gap)
+            // The panel hugs the keys: one bar for the bottom line plus a tab
+            // behind ↑, flattened before the opacity so the overlap is even.
+            .backgroundPreferenceValue(UpKeyBounds.self) { anchor in
+                GeometryReader { g in
+                    ZStack(alignment: .topLeading) {
+                        RoundedRectangle(cornerRadius: 12)
+                            .frame(height: keyHeight + 2 * gap)
+                            .frame(maxHeight: .infinity, alignment: .bottom)
+                        if let up = anchor.map({ g[$0] }) {
+                            RoundedRectangle(cornerRadius: 12)
+                                .frame(width: up.width + 2 * gap, height: up.height + 4 * gap)
+                                .offset(x: up.minX - gap, y: up.minY - gap)
+                        }
+                    }
+                    .foregroundColor(.black)
+                    .compositingGroup()
+                    .opacity(0.85)
+                }
+            }
             .padding(.bottom, max(0, controls.dockedKeyboardHeight - LocalControls.barHeight) + 6)
             .environment(\.colorScheme, .dark)
         }
+    }
+
+    private var divider: some View {
+        Divider().frame(height: 24).overlay(Color.white.opacity(0.3))
+            .frame(height: keyHeight)
     }
 
     private func sendKey(_ title: String, _ code: Int) -> some View {
@@ -302,14 +331,21 @@ struct MacKeysRow: View {
     private func key(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 22, weight: .medium))
+                .font(.system(size: 18, weight: .medium))
                 .foregroundColor(.white)
-                .frame(minWidth: 58, minHeight: 43)
+                .frame(minWidth: keyWidth, minHeight: keyHeight)
                 .background(RoundedRectangle(cornerRadius: 8)
                     .fill(active ? Color.accentColor : Color.white.opacity(0.18)))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct UpKeyBounds: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = value ?? nextValue()
     }
 }
 
