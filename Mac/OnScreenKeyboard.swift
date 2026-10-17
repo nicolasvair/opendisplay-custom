@@ -257,21 +257,55 @@ final class KeyPoster {
         // A keyboard event carries a limited number of UTF-16 units (~20), so
         // longer text (dictation) goes out as one down/up pair per chunk.
         let pieces = text.utf16.count > 16 ? TextChunking.chunks(text, maxUTF16: 16) : [text]
-        for piece in pieces {
-            let units = Array(piece.utf16)
-            for down in [true, false] {
-                guard let e = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
-                e.flags = flags
-                e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
-                e.post(tap: .cghidEventTap)
+        holding(flags) {
+            for piece in pieces {
+                let units = Array(piece.utf16)
+                for down in [true, false] {
+                    guard let e = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
+                    e.flags = flags
+                    e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                    e.post(tap: .cghidEventTap)
+                }
             }
         }
     }
 
     func press(code: CGKeyCode, flags: CGEventFlags) {
-        for down in [true, false] {
-            guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { continue }
-            e.flags = flags
+        holding(flags) {
+            for down in [true, false] {
+                guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { continue }
+                e.flags = flags
+                e.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    private nonisolated static let modifierKeys: [(flag: CGEventFlags, code: CGKeyCode)] = [
+        (.maskCommand, 55), (.maskShift, 56), (.maskAlternate, 58), (.maskControl, 59),
+    ]
+
+    /// Presses the modifier keys in `flags` around `body` and releases them
+    /// after, as a real keyboard does. Flags on the keystroke alone left ⌘ or
+    /// ⇧ latched in the system state: the clicks posted next (⌘⇧N in Mail,
+    /// then a click) arrived as ⌘⇧-clicks. The releases end on a flag-less
+    /// flagsChanged, which clears that state and tells apps the keys are up.
+    private func holding(_ flags: CGEventFlags, _ body: () -> Void) {
+        Self.postModifiers(flags, down: true, source: source)
+        body()
+        Self.postModifiers(flags, down: false, source: source)
+    }
+
+    /// Presses (or releases, in reverse order, ending flag-less) the modifier
+    /// keys in `flags`. Also used by the injector around a modified click.
+    nonisolated static func postModifiers(_ flags: CGEventFlags, down: Bool, source: CGEventSource?) {
+        let keys = modifierKeys.filter { flags.contains($0.flag) }
+        var current: CGEventFlags = down ? [] : flags.intersection([.maskCommand, .maskShift,
+                                                                    .maskAlternate, .maskControl])
+        for key in down ? keys : keys.reversed() {
+            if down { current.insert(key.flag) } else { current.remove(key.flag) }
+            guard let e = CGEvent(keyboardEventSource: source, virtualKey: key.code, keyDown: down) else { continue }
+            e.type = .flagsChanged
+            e.flags = current
             e.post(tap: .cghidEventTap)
         }
     }
