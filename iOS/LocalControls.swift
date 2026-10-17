@@ -39,8 +39,9 @@ final class LocalControls: ObservableObject {
     @Published var keyboardShift: CGFloat = 0
     /// Whether the latest shift change should animate.
     var animateShift = false
-    /// Height the Mac keys row takes above the bar or the keyboard.
-    static let keysRowHeight: CGFloat = 54
+    /// Height the Mac keys row takes above the bar or the keyboard: two key
+    /// lines (the inverted T), the gap, padding and the margin below.
+    static let keysRowHeight = 2 * MacKeysRow.keyHeight + 4 * MacKeysRow.gap
     /// Sticky one-shot modifiers from the Mac keys row (1 ⌘, 2 ⌥, 4 ⌃, 8 ⇧).
     @Published var mods = 0
     /// Height of a docked keyboard (0 when hidden or floating), so the keys
@@ -257,26 +258,30 @@ final class MacKeyInputView: UIView, UIKeyInput {
     }
 }
 
-/// The Mac keys row: ⌘ ⌥ ⌃ ⇧ (one-shot), Esc, Tab, arrows, ⌦. Overlaid on the
+/// The Mac keys row: Esc, Tab, ⇧ ⌃ ⌥ ⌘ (one-shot), arrows. Overlaid on the
 /// bottom of the picture just above the bar, or above a docked keyboard; a
 /// floating keyboard never covers it.
 struct MacKeysRow: View {
     @ObservedObject var controls = LocalControls.shared
     @Environment(\.horizontalSizeClass) private var sizeClass
 
-    private let keyHeight: CGFloat = 43
-    private let gap: CGFloat = 6
+    static let keyHeight: CGFloat = 43
+    static let gap: CGFloat = 6
+    private var keyHeight: CGFloat { Self.keyHeight }
+    private var gap: CGFloat { Self.gap }
     private var keyWidth: CGFloat { sizeClass == .regular ? 72 : 50 }
 
     var body: some View {
         if controls.keyboardVisible {
             HStack(alignment: .bottom, spacing: gap) {
-                ForEach([("⌘", 1), ("⌥", 2), ("⌃", 4), ("⇧", 8)], id: \.1) { title, bit in
-                    key(title, active: controls.mods & bit != 0) { controls.mods ^= bit }
-                }
-                divider
                 sendKey("esc", 53)
                 sendKey("tab", 48)
+                modKey("⇧", 8)
+                divider
+                modKey("⌃", 4)
+                modKey("⌥", 2)
+                modKey("⌘", 1)
+                divider
                 // Inverted T, as on the Mac keyboard: ↑ over ← ↓ →.
                 VStack(spacing: gap) {
                     sendKey("↑", 126)
@@ -287,9 +292,6 @@ struct MacKeysRow: View {
                         sendKey("→", 124)
                     }
                 }
-                sendKey("⌦", 117)
-                divider
-                key("⌨︎↓", active: false) { controls.keyboardVisible = false }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, gap)
@@ -320,6 +322,10 @@ struct MacKeysRow: View {
     private var divider: some View {
         Divider().frame(height: 24).overlay(Color.white.opacity(0.3))
             .frame(height: keyHeight)
+    }
+
+    private func modKey(_ title: String, _ bit: Int) -> some View {
+        key(title, active: controls.mods & bit != 0) { controls.mods ^= bit }
     }
 
     private func sendKey(_ title: String, _ code: Int) -> some View {
