@@ -21,12 +21,24 @@ final class LocalControls: ObservableObject {
     @Published var mode = LocalPointerMode(rawValue: UserDefaults.standard.string(forKey: "pointerMode") ?? "")
         ?? .touch {
         didSet {
-            UserDefaults.standard.set(mode.rawValue, forKey: "pointerMode")
+            if persistsMode { UserDefaults.standard.set(mode.rawValue, forKey: "pointerMode") }
             // The Mac brings a cursor left on another screen back onto the
             // mirrored one, where this trackpad can see it.
             if mode != oldValue { receiver?.sendPointerMode(mode.rawValue) }
         }
     }
+    /// False while a layout forces the mode (the iPhone mirror screen): the
+    /// forced value must not reach UserDefaults, so that killing the app
+    /// there does not change the mode of the next launch.
+    private var persistsMode = true
+
+    /// Set the mode without remembering it (the Mac is still told).
+    func setTransientMode(_ new: LocalPointerMode) {
+        persistsMode = false
+        mode = new
+        persistsMode = true
+    }
+
     /// Touch mode: the next tap becomes a right click, then it disarms.
     @Published var rightClickArmed = false
     @Published var keyboardVisible = false
@@ -37,11 +49,36 @@ final class LocalControls: ObservableObject {
     /// How far (points) the picture is currently slid up; the video view
     /// computes it, the screen applies it as an offset.
     @Published var keyboardShift: CGFloat = 0
+    /// iPhone: the bar rides above a docked keyboard (it would otherwise sit
+    /// under it, out of reach, and the phone keyboard has no dismiss key).
+    static var barRaisedAboveKeyboard: Bool { UIDevice.current.userInterfaceIdiom == .phone }
+    /// How much of the picture's bottom a docked keyboard of this height
+    /// hides: the keyboard minus the bar's own strip (the bar lies under the
+    /// keyboard on iPad), or the whole keyboard when the bar is raised.
+    static func pictureCovered(byKeyboard docked: CGFloat) -> CGFloat {
+        barRaisedAboveKeyboard ? docked : max(0, docked - barHeight)
+    }
+    /// Space under the overlaid keys row: just above a docked keyboard (and
+    /// above the bar when that rides on it).
+    static func keysRowBottomPadding(docked: CGFloat) -> CGFloat {
+        if barRaisedAboveKeyboard, docked > 0 { return docked + 6 }
+        return max(0, docked - barHeight) + 6
+    }
     /// Whether the latest shift change should animate.
     var animateShift = false
     /// Height the Mac keys row takes above the bar or the keyboard: two key
     /// lines (the inverted T), the gap, padding and the margin below.
-    static let keysRowHeight = 2 * MacKeysRow.keyHeight + 4 * MacKeysRow.gap
+    /// One line (arrows side by side) on a landscape iPhone, where height is
+    /// scarce; the inverted T otherwise.
+    static var keysRowHeight: CGFloat {
+        phoneLandscape ? MacKeysRow.keyHeight + 3 * MacKeysRow.gap
+            : 2 * MacKeysRow.keyHeight + 4 * MacKeysRow.gap
+    }
+    /// An iPhone held sideways.
+    static var phoneLandscape: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone
+            && UIScreen.main.bounds.width > UIScreen.main.bounds.height
+    }
     /// Sticky one-shot modifiers from the Mac keys row (1 ⌘, 2 ⌥, 4 ⌃, 8 ⇧).
     @Published var mods = 0
     /// Modifiers locked by a swipe up on their key: they ride on every key
@@ -103,10 +140,132 @@ struct LocalControlBar: View {
     @ObservedObject var controls = LocalControls.shared
     @ObservedObject var dictation = DictationController.shared
 
+    /// Forces the compact (phone) arrangement; it is also chosen on any iPhone.
+    var compact = false
+    /// Souris/Tactile switch and right-click button (compact bar). Hidden on
+    /// the iPhone mirror screen, where the pointer is always a mouse.
+    var showsPointerMode = true
+    /// A column of icon buttons for the side of a landscape screen (the
+    /// iPhone mirror layout), where height is scarce: keyboard, dictation,
+    /// Extend/Mirror menu, Mac screen menu.
+    var vertical = false
+
     /// Every iPad is under 1100 pt wide in portrait and over it in landscape.
     @State private var portrait = false
+    /// Window safe-area insets: the compact bar keeps its buttons out from
+    /// under the Dynamic Island and the rounded corners in landscape.
+    @State private var insets = UIEdgeInsets.zero
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    private var isCompact: Bool {
+        // iPhone Plus/Max report a regular width in landscape: the idiom is
+        // the surer test there.
+        compact || sizeClass == .compact || UIDevice.current.userInterfaceIdiom == .phone
+    }
 
     var body: some View {
+        Group {
+            if vertical {
+                verticalBar
+            } else {
+                Group {
+                    if isCompact { compactBar } else { regularBar }
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: LocalControls.barHeight)
+            }
+        }
+        .background(SafeAreaInsetsReader { insets = $0 })
+        .background(Color.black)
+        .environment(\.colorScheme, .dark)
+    }
+
+    // MARK: Vertical (landscape iPhone mirror): a column of icons
+
+    private var verticalBar: some View {
+        VStack(spacing: 6) {
+            barButton(systemImage: "keyboard", active: controls.keyboardVisible, width: 44) {
+                controls.keyboardVisible.toggle()
+            }
+            barButton(systemImage: dictation.isListening ? "mic.fill" : "mic",
+                      active: dictation.isListening, width: 44) {
+                dictation.toggle()
+            }
+            if let current = receiver.senderMode {
+                Menu {
+                    Picker("", selection: Binding(get: { current },
+                                                  set: { receiver.requestMode($0) })) {
+                        Text("Étendre").tag("extend")
+                        Text("Recopie").tag("mirror")
+                    }
+                } label: {
+                    Image(systemName: current == "mirror" ? "rectangle.on.rectangle" : "rectangle.split.2x1")
+                        .font(.system(size: 20))
+                        .frame(width: 44, height: 34)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.18)))
+                        .contentShape(Rectangle())
+                }
+                .foregroundColor(.white)
+                if current == "mirror", receiver.macDisplays.count > 1 {
+                    displayMenu(iconOnly: true)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(width: 44)
+    }
+
+    // MARK: Compact (iPhone): icon buttons, no speed slider
+
+    private var compactBar: some View {
+        HStack(spacing: 4) {
+            barButton(systemImage: "keyboard", active: controls.keyboardVisible, width: 44) {
+                controls.keyboardVisible.toggle()
+            }
+            barButton(systemImage: dictation.isListening ? "mic.fill" : "mic",
+                      active: dictation.isListening, width: 44) {
+                dictation.toggle()
+            }
+            Spacer(minLength: 0)
+            if let current = receiver.senderMode {
+                Picker("", selection: Binding(get: { current },
+                                              set: { receiver.requestMode($0) })) {
+                    Text("Étendre").tag("extend")
+                    Text("Recopie").tag("mirror")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 130)
+                // The labels must stay readable: the icon-only pointer
+                // switch below gives way first when the line is tight.
+                .layoutPriority(1)
+                if current == "mirror", receiver.macDisplays.count > 1 {
+                    displayMenu(iconOnly: true)
+                }
+            }
+            Spacer(minLength: 0)
+            if showsPointerMode {
+                if controls.mode == .touch {
+                    barButton(systemImage: "cursorarrow.click.2", active: controls.rightClickArmed, width: 44) {
+                        controls.rightClickArmed.toggle()
+                    }
+                }
+                Picker("", selection: $controls.mode) {
+                    Image(systemName: "rectangle.and.hand.point.up.left").tag(LocalPointerMode.trackpad)
+                    Image(systemName: "hand.point.up").tag(LocalPointerMode.touch)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 100)
+            }
+        }
+        .padding(.leading, max(8, insets.left))
+        .padding(.trailing, max(8, insets.right))
+    }
+
+    // MARK: Regular (iPad)
+
+    private var regularBar: some View {
         HStack(spacing: 12) {
             // Left: keyboard and dictation.
             HStack(spacing: 12) {
@@ -164,17 +323,16 @@ struct LocalControlBar: View {
         }
         .padding(.horizontal, 16)
         .frame(maxWidth: .infinity)
-        .frame(height: LocalControls.barHeight)
         .background(GeometryReader { geo in
             Color.clear
                 .onAppear { portrait = geo.size.width < 1100 }
                 .onChange(of: geo.size.width) { portrait = $0 < 1100 }
         })
-        .background(Color.black)
-        .environment(\.colorScheme, .dark)
     }
 
-    private var displayMenu: some View {
+    private var displayMenu: some View { displayMenu(iconOnly: false) }
+
+    private func displayMenu(iconOnly: Bool) -> some View {
         let selected = receiver.macDisplays.first { $0.id == receiver.selectedMacDisplay }
             ?? receiver.macDisplays.first { $0.main }
             ?? receiver.macDisplays.first
@@ -196,12 +354,14 @@ struct LocalControlBar: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "display.2").font(.system(size: 18))
-                Text(selected?.name ?? "Écran")
-                    .font(.system(size: 16, weight: .medium))
-                    .lineLimit(1)
+                if !iconOnly {
+                    Text(selected?.name ?? "Écran")
+                        .font(.system(size: 16, weight: .medium))
+                        .lineLimit(1)
+                }
             }
-            .padding(.horizontal, 12)
-            .frame(maxWidth: 220, minHeight: 34)
+            .padding(.horizontal, iconOnly ? 0 : 12)
+            .frame(maxWidth: iconOnly ? 44 : 220, minHeight: 34)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.18)))
             .contentShape(Rectangle())
         }
@@ -209,13 +369,13 @@ struct LocalControlBar: View {
     }
 
     private func barButton(systemImage: String? = nil, title: String? = nil, active: Bool,
-                           action: @escaping () -> Void) -> some View {
+                           width: CGFloat = 110, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Group {
                 if let systemImage { Image(systemName: systemImage).font(.system(size: 20)) }
                 if let title { Text(title).font(.system(size: 16, weight: .medium)) }
             }
-            .frame(width: 110, height: 34)
+            .frame(width: width, height: 34)
             .background(RoundedRectangle(cornerRadius: 8)
                 .fill(active ? Color.accentColor : Color.white.opacity(0.18)))
             .contentShape(Rectangle())
@@ -277,48 +437,114 @@ final class MacKeyInputView: UIView, UIKeyInput {
 
 /// The Mac keys row: dictation, Esc, Tab, ⇧ ⌃ ⌥ ⌘ (one-shot), arrows. Overlaid on the
 /// bottom of the picture just above the bar, or above a docked keyboard; a
-/// floating keyboard never covers it.
+/// floating keyboard never covers it. The `.phone` layout is the iPhone mirror
+/// screen's: in the layout flow (the screen reserves the keyboard's room
+/// itself) and sized to fit a 390 pt wide screen, inverted T included.
 struct MacKeysRow: View {
+    enum Layout { case overlay, phone, phoneWide }
+
+    var layout: Layout = .overlay
     @ObservedObject var controls = LocalControls.shared
     @ObservedObject var dictation = DictationController.shared
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     static let keyHeight: CGFloat = 43
     static let gap: CGFloat = 6
-    private var keyHeight: CGFloat { Self.keyHeight }
-    private var gap: CGFloat { Self.gap }
+    private var phone: Bool { layout != .overlay }
+    /// Landscape phone: one line, arrows side by side (no inverted T).
+    private var wide: Bool { layout == .phoneWide || (layout == .overlay && LocalControls.phoneLandscape) }
+    /// Window safe-area insets: a full-width landscape overlay keeps its keys
+    /// out from under the notch / Dynamic Island.
+    @State private var insets = UIEdgeInsets.zero
+    private var keyHeight: CGFloat { phone ? 38 : Self.keyHeight }
+    private var gap: CGFloat { phone ? 4 : Self.gap }
     private var keyWidth: CGFloat { sizeClass == .regular ? 72 : 50 }
+    private var hPadding: CGFloat {
+        if phone { return 8 }
+        return wide ? max(10, insets.left, insets.right) : 10
+    }
+    /// Keys share the line width instead of having a natural one: the phone
+    /// layout, and the overlay on a narrow screen (iPhone in portrait; the
+    /// natural row is ~600 pt wide). iPad and iPhone landscape are untouched.
+    private var flexible: Bool {
+        phone || (UIDevice.current.userInterfaceIdiom == .phone
+                  && (UIScreen.main.bounds.width < 620 || LocalControls.phoneLandscape))
+    }
 
     var body: some View {
         if controls.keyboardVisible {
-            HStack(alignment: .bottom, spacing: gap) {
-                key(systemImage: dictation.isListening ? "mic.fill" : "mic",
-                    active: dictation.isListening) { dictation.toggle() }
-                divider
-                sendKey("esc", 53)
-                sendKey("tab", 48)
-                modKey("⇧", 8)
-                divider
-                modKey("⌃", 4)
-                modKey("⌥", 2)
-                modKey("⌘", 1)
-                divider
-                // Inverted T, as on the Mac keyboard: ↑ over ← ↓ →.
-                VStack(spacing: gap) {
-                    sendKey("↑", 126)
-                        .anchorPreference(key: UpKeyBounds.self, value: .bounds) { $0 }
-                    HStack(spacing: gap) {
-                        sendKey("←", 123)
-                        sendKey("↓", 125)
-                        sendKey("→", 124)
+            Group {
+                if flexible {
+                    // Ten key widths share the line with three dividers (1 pt).
+                    GeometryReader { geo in
+                        let keys: CGFloat = wide ? 11 : 10
+                        let gaps: CGFloat = wide ? 13 : 12
+                        let unit = max(20, (geo.size.width - 2 * hPadding - gaps * gap - 3) / keys)
+                        row(unit: unit)
+                            .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
                     }
+                    .frame(height: wide ? keyHeight + 2 * gap : 2 * keyHeight + 3 * gap)
+                } else {
+                    row(unit: nil)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, gap)
-            // The panel hugs the keys: one bar for the bottom line plus a tab
-            // behind ↑, flattened before the opacity so the overlap is even.
-            .backgroundPreferenceValue(UpKeyBounds.self) { anchor in
+            .padding(.bottom, phone ? 0 : LocalControls.keysRowBottomPadding(docked: controls.dockedKeyboardHeight))
+            .background(SafeAreaInsetsReader { insets = $0 })
+        }
+    }
+
+    /// `unit`: the exact width of one key (phone layout); nil lets keys take
+    /// their natural width.
+    @ViewBuilder
+    private func row(unit: CGFloat?) -> some View {
+        HStack(alignment: .bottom, spacing: gap) {
+            key(systemImage: dictation.isListening ? "mic.fill" : "mic",
+                active: dictation.isListening, unit: unit) { dictation.toggle() }
+            divider
+            sendKey("esc", 53, unit: unit)
+            sendKey("tab", 48, unit: unit)
+            modKey("⇧", 8, unit: unit)
+            divider
+            modKey("⌃", 4, unit: unit)
+            modKey("⌥", 2, unit: unit)
+            modKey("⌘", 1, unit: unit)
+            divider
+            if wide {
+                HStack(spacing: gap) {
+                    sendKey("←", 123, unit: unit)
+                    sendKey("↑", 126, unit: unit)
+                    sendKey("↓", 125, unit: unit)
+                    sendKey("→", 124, unit: unit)
+                }
+            } else {
+            // Inverted T, as on the Mac keyboard: ↑ over ← ↓ →.
+            VStack(spacing: gap) {
+                if let unit {
+                    HStack(spacing: gap) {
+                        Color.clear.frame(width: unit, height: 0)
+                        sendKey("↑", 126, unit: unit)
+                            .anchorPreference(key: UpKeyBounds.self, value: .bounds) { $0 }
+                        Color.clear.frame(width: unit, height: 0)
+                    }
+                } else {
+                    sendKey("↑", 126, unit: nil)
+                        .anchorPreference(key: UpKeyBounds.self, value: .bounds) { $0 }
+                }
+                HStack(spacing: gap) {
+                    sendKey("←", 123, unit: unit)
+                    sendKey("↓", 125, unit: unit)
+                    sendKey("→", 124, unit: unit)
+                }
+            }
+            }
+        }
+        .padding(.horizontal, hPadding)
+        .padding(.vertical, gap)
+        // The panel hugs the keys: one bar for the bottom line plus a tab
+        // behind ↑, flattened before the opacity so the overlap is even.
+        // (The phone layout sits on black already.)
+        .backgroundPreferenceValue(UpKeyBounds.self) { anchor in
+            if !phone {
                 GeometryReader { g in
                     ZStack(alignment: .topLeading) {
                         RoundedRectangle(cornerRadius: 12)
@@ -335,20 +561,19 @@ struct MacKeysRow: View {
                     .opacity(0.85)
                 }
             }
-            .padding(.bottom, max(0, controls.dockedKeyboardHeight - LocalControls.barHeight) + 6)
-            .environment(\.colorScheme, .dark)
         }
+        .environment(\.colorScheme, .dark)
     }
 
     private var divider: some View {
-        Divider().frame(height: 24).overlay(Color.white.opacity(0.3))
+        Divider().frame(width: flexible ? 1 : nil, height: 24).overlay(Color.white.opacity(0.3))
             .frame(height: keyHeight)
     }
 
     /// Tap for one key, swipe up to lock (a bar under the symbol shows it).
-    private func modKey(_ title: String, _ bit: Int) -> some View {
+    private func modKey(_ title: String, _ bit: Int, unit: CGFloat?) -> some View {
         let locked = controls.lockedMods & bit != 0
-        return key(title, active: locked || controls.mods & bit != 0, locked: locked) {
+        return key(title, active: locked || controls.mods & bit != 0, locked: locked, unit: unit) {
             controls.tapModifier(bit)
         }
         .highPriorityGesture(DragGesture(minimumDistance: 12).onEnded { drag in
@@ -359,21 +584,22 @@ struct MacKeysRow: View {
         })
     }
 
-    private func sendKey(_ title: String, _ code: Int) -> some View {
-        key(title, active: false) {
+    private func sendKey(_ title: String, _ code: Int, unit: CGFloat?) -> some View {
+        key(title, active: false, unit: unit) {
             controls.receiver?.sendKey(code: code, mods: controls.takeMods())
         }
     }
 
     private func key(_ title: String = "", systemImage: String? = nil, active: Bool,
-                     locked: Bool = false, action: @escaping () -> Void) -> some View {
+                     locked: Bool = false, unit: CGFloat?, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Group {
                 if let systemImage { Image(systemName: systemImage) } else { Text(title) }
             }
-                .font(.system(size: 18, weight: .medium))
+                .font(.system(size: flexible ? 15 : 18, weight: .medium))
                 .foregroundColor(.white)
-                .frame(minWidth: keyWidth, minHeight: keyHeight)
+                .frame(minWidth: unit == nil ? keyWidth : nil, minHeight: keyHeight)
+                .frame(width: unit)
                 .overlay(Capsule().fill(Color.white).frame(width: 14, height: 3)
                     .padding(.bottom, 5).opacity(locked ? 1 : 0), alignment: .bottom)
                 .background(RoundedRectangle(cornerRadius: 8)
@@ -601,5 +827,42 @@ final class TrackpadEngine {
     private func stopMomentum() {
         momentum?.invalidate()
         momentum = nil
+    }
+}
+
+// MARK: - Safe area reader
+
+/// Reports the window's safe-area insets (also when they change, on
+/// rotation). The receiver screen ignores the safe area to use the whole
+/// panel, so views that must stay clear of the Dynamic Island, the rounded
+/// corners or the home indicator read them from here.
+struct SafeAreaInsetsReader: UIViewRepresentable {
+    let onChange: (UIEdgeInsets) -> Void
+
+    func makeUIView(context: Context) -> InsetsView {
+        let view = InsetsView()
+        view.isUserInteractionEnabled = false
+        view.onChange = onChange
+        return view
+    }
+
+    func updateUIView(_ uiView: InsetsView, context: Context) {
+        uiView.onChange = onChange
+    }
+
+    final class InsetsView: UIView {
+        var onChange: ((UIEdgeInsets) -> Void)?
+        private var last: UIEdgeInsets?
+
+        override func didMoveToWindow() { super.didMoveToWindow(); report() }
+        override func safeAreaInsetsDidChange() { super.safeAreaInsetsDidChange(); report() }
+        override func layoutSubviews() { super.layoutSubviews(); report() }
+
+        private func report() {
+            guard let insets = window?.safeAreaInsets, insets != last else { return }
+            last = insets
+            // Never mutate SwiftUI state in the middle of a layout pass.
+            DispatchQueue.main.async { [weak self] in self?.onChange?(insets) }
+        }
     }
 }

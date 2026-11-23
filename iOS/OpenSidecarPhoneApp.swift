@@ -55,6 +55,13 @@ struct ReceiverScreen: View {
         model.receiver.connected && model.receiver.videoSize != .zero
     }
 
+    /// iPhone mirroring gets its own layout, portrait or landscape: the Mac
+    /// screen small inside a big trackpad (PhoneMirrorLayout). Everything else
+    /// keeps the picture-plus-bar layout.
+    private var phoneMirror: Bool {
+        deviceKind == "iPhone" && isStreaming && model.receiver.senderMode == "mirror"
+    }
+
     // Below the force floor → present the blocking gate (issue #135). The
     // fullScreenCover binding's setter is a no-op so the user can't dismiss it.
     private var requiredUpdate: VersionGate.Update? {
@@ -73,25 +80,34 @@ struct ReceiverScreen: View {
             ZStack {
                 if isStreaming {
                     Color.black.ignoresSafeArea()
-                    // The picture fills the screen above the local control
-                    // bar; the Mac was told the desktop is that much shorter.
-                    // The keyboard floats over it without resizing anything.
-                    VStack(spacing: 0) {
-                        VideoLayerView(displayLayer: model.receiver.displayLayer,
-                                       receiver: model.receiver,
-                                       useMetal: metalRenderer)
-                            .id(metalRenderer)   // rebuild the layer tree on toggle
-                            // Slide clear of a docked keyboard ("Décaler").
-                            // Before the overlay, so the keys row stays put.
-                            .offset(y: -controls.keyboardShift)
-                            // Glide when the keyboard comes or goes; track
-                            // the cursor frame by frame.
-                            .animation(controls.animateShift ? .easeOut(duration: 0.25) : nil,
-                                       value: controls.keyboardShift)
-                            .overlay(MacKeysRow(), alignment: .bottom)
-                        LocalControlBar(receiver: model.receiver)
+                    if phoneMirror {
+                        PhoneMirrorLayout(receiver: model.receiver, useMetal: metalRenderer)
+                    } else {
+                        // The picture fills the screen above the local control
+                        // bar; the Mac was told the desktop is that much shorter.
+                        // The keyboard floats over it without resizing anything.
+                        VStack(spacing: 0) {
+                            VideoLayerView(displayLayer: model.receiver.displayLayer,
+                                           receiver: model.receiver,
+                                           useMetal: metalRenderer)
+                                .id(metalRenderer)   // rebuild the layer tree on toggle
+                                // Slide clear of a docked keyboard ("Décaler").
+                                // Before the overlay, so the keys row stays put.
+                                .offset(y: -controls.keyboardShift)
+                                // Glide when the keyboard comes or goes; track
+                                // the cursor frame by frame.
+                                .animation(controls.animateShift ? .easeOut(duration: 0.25) : nil,
+                                           value: controls.keyboardShift)
+                                .overlay(MacKeysRow(), alignment: .bottom)
+                            LocalControlBar(receiver: model.receiver)
+                                // iPhone: ride above a docked keyboard, else
+                                // the bar (and the keyboard toggle) is hidden.
+                                .offset(y: LocalControls.barRaisedAboveKeyboard
+                                        ? -controls.dockedKeyboardHeight : 0)
+                                .animation(.easeOut(duration: 0.25), value: controls.dockedKeyboardHeight)
+                        }
+                        .ignoresSafeArea()
                     }
-                    .ignoresSafeArea()
                     DictationOverlay()
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     if showAnalytics {
@@ -658,6 +674,24 @@ final class ReceiverModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        #if DEBUG
+        // `-previewStream mirror|extend`: pretend a Mac is streaming so the
+        // streaming layouts can be looked at in the simulator without one.
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-previewStream"), i + 1 < args.count {
+            receiver.videoSize = CGSize(width: 2880, height: 1800)
+            receiver.senderMode = args[i + 1]
+            // `-previewDisplays` adds a second Mac screen (the display menu).
+            if args.contains("-previewDisplays") {
+                receiver.macDisplays = [
+                    MirrorDisplayInfo(id: "d1", name: "Built-in Retina Display", w: 2880, h: 1800, main: true),
+                    MirrorDisplayInfo(id: "d2", name: "LG UltraFine", w: 3840, h: 2160, main: false),
+                ]
+            }
+            receiver.connected = true
+            return
+        }
+        #endif
         receiver.start(port: 9000)
     }
 
@@ -973,7 +1007,7 @@ struct VideoLayerView: UIViewRepresentable {
             let current = controls.keyboardShift
             var target: CGFloat = 0
             if controls.followKeyboard, controls.keyboardVisible, controls.dockedKeyboardHeight > 0 {
-                let hidden = max(0, controls.dockedKeyboardHeight - LocalControls.barHeight)
+                let hidden = LocalControls.pictureCovered(byKeyboard: controls.dockedKeyboardHeight)
                     + LocalControls.keysRowHeight
                 let visible = bounds.height - hidden
                 if visible > 0, let rect = videoRect() {
