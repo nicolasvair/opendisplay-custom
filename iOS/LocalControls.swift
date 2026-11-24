@@ -147,7 +147,7 @@ struct LocalControlBar: View {
     var showsPointerMode = true
     /// A column of icon buttons for the side of a landscape screen (the
     /// iPhone mirror layout), where height is scarce: keyboard, dictation,
-    /// Extend/Mirror menu, Mac screen menu.
+    /// Extend/Mirror menu, Mac screen menu, trackpad speed.
     var vertical = false
 
     /// Every iPad is under 1100 pt wide in portrait and over it in landscape.
@@ -155,6 +155,13 @@ struct LocalControlBar: View {
     /// Window safe-area insets: the compact bar keeps its buttons out from
     /// under the Dynamic Island and the rounded corners in landscape.
     @State private var insets = UIEdgeInsets.zero
+    /// Popup of the trackpad speed slider (iPhone bars).
+    @State private var speedShown = false
+    /// Frame of the speed button in the bar's own coordinate space: the
+    /// popover is anchored to the bar (a view that survives a rotation) at
+    /// this rect, not to the button, which is rebuilt when the mirror layout
+    /// swaps the vertical and compact bars.
+    @State private var speedFrames: [Bool: CGRect] = [:]
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     private var isCompact: Bool {
@@ -175,10 +182,20 @@ struct LocalControlBar: View {
                 .frame(height: LocalControls.barHeight)
             }
         }
+        .coordinateSpace(name: Self.barSpace)
+        .onPreferenceChange(SpeedButtonFrameKey.self) { speedFrames.merge($0) { _, new in new } }
+        .onChange(of: vertical) { _ in speedShown = false }   // mirror rotation: the button changes bar
+        .onChange(of: controls.mode) { if $0 != .trackpad { speedShown = false } }
         .background(SafeAreaInsetsReader { insets = $0 })
         .background(Color.black)
         .environment(\.colorScheme, .dark)
+        // Presented from the bar itself, outside the vertical/compact switch:
+        // a popover anchored to a button that leaves the hierarchy during a
+        // rotation is orphaned (white screen, content only, no dismissal).
+        .speedPopover(isPresented: $speedShown, anchor: speedFrames[vertical] ?? .zero, speed: $controls.trackpadSpeed)
     }
+
+    private static let barSpace = "LocalControlBar"
 
     // MARK: Vertical (landscape iPhone mirror): a column of icons
 
@@ -210,12 +227,13 @@ struct LocalControlBar: View {
                     displayMenu(iconOnly: true)
                 }
             }
+            speedButton(vertical: true)
             Spacer(minLength: 0)
         }
         .frame(width: 44)
     }
 
-    // MARK: Compact (iPhone): icon buttons, no speed slider
+    // MARK: Compact (iPhone): icon buttons; speed in a popover
 
     private var compactBar: some View {
         HStack(spacing: 4) {
@@ -249,6 +267,8 @@ struct LocalControlBar: View {
                     barButton(systemImage: "cursorarrow.click.2", active: controls.rightClickArmed, width: 44) {
                         controls.rightClickArmed.toggle()
                     }
+                } else {
+                    speedButton(vertical: false)   // same spot as the right click, as on the iPad
                 }
                 Picker("", selection: $controls.mode) {
                     Image(systemName: "rectangle.and.hand.point.up.left").tag(LocalPointerMode.trackpad)
@@ -257,6 +277,8 @@ struct LocalControlBar: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(maxWidth: 100)
+            } else {
+                speedButton(vertical: false)   // mirror portrait: always a trackpad, button on the right
             }
         }
         .padding(.leading, max(8, insets.left))
@@ -332,6 +354,17 @@ struct LocalControlBar: View {
 
     private var displayMenu: some View { displayMenu(iconOnly: false) }
 
+    private func speedButton(vertical inVerticalBar: Bool) -> some View {
+        barButton(systemImage: "speedometer", active: speedShown, width: 44) {
+            speedShown.toggle()
+        }
+        .background(GeometryReader { proxy in
+            Color.clear.preference(key: SpeedButtonFrameKey.self,
+                                   value: [inVerticalBar: proxy.frame(in: .named(Self.barSpace))])
+        })
+        .accessibilityLabel("Vitesse du curseur")
+    }
+
     private func displayMenu(iconOnly: Bool) -> some View {
         let selected = receiver.macDisplays.first { $0.id == receiver.selectedMacDisplay }
             ?? receiver.macDisplays.first { $0.main }
@@ -382,6 +415,64 @@ struct LocalControlBar: View {
         }
         .buttonStyle(.plain)
         .foregroundColor(.white)
+    }
+}
+
+/// Content of the trackpad speed popup. Same range and icons as the iPad slider.
+private struct TrackpadSpeedPanel: View {
+    @Binding var speed: Double
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("Vitesse du curseur").font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Text(String(format: "×%.1f", speed)).monospacedDigit().foregroundColor(.gray)
+            }
+            HStack(spacing: 10) {
+                Image(systemName: "tortoise").foregroundColor(.gray)
+                Slider(value: $speed, in: 0.4...2.5)
+                Image(systemName: "hare").foregroundColor(.gray)
+            }
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+}
+
+/// Where the speed button sits inside the bar, for the popover's arrow.
+/// Keyed by the bar that holds the button (vertical or compact): while the
+/// mirror layout swaps bars, the outgoing one still reports a stale frame
+/// for a moment, and the popover must follow the current one.
+private struct SpeedButtonFrameKey: PreferenceKey {
+    static var defaultValue: [Bool: CGRect] = [:]
+    static func reduce(value: inout [Bool: CGRect], nextValue: () -> [Bool: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+private extension View {
+    /// A real popover on iOS 16.4+, its arrow pointing at `anchor` (the
+    /// compact adaptation keeps it a bubble on iPhone); a sheet on older
+    /// systems.
+    @ViewBuilder
+    func speedPopover(isPresented: Binding<Bool>, anchor: CGRect, speed: Binding<Double>) -> some View {
+        if #available(iOS 16.4, *) {
+            popover(isPresented: isPresented, attachmentAnchor: .rect(.rect(anchor))) {
+                TrackpadSpeedPanel(speed: speed)
+                    .presentationCompactAdaptation(.popover)
+            }
+        } else if #available(iOS 16, *) {
+            sheet(isPresented: isPresented) {
+                TrackpadSpeedPanel(speed: speed)
+                    .frame(maxWidth: .infinity)
+                    .presentationDetents([.height(120)])
+            }
+        } else {
+            sheet(isPresented: isPresented) {   // iOS 15: full-height sheet, swipe to dismiss
+                TrackpadSpeedPanel(speed: speed)
+            }
+        }
     }
 }
 
